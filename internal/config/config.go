@@ -11,7 +11,6 @@ type Config struct {
 	MaxConcurrent    int    `json:"max_concurrent"`
 	DownloadDir      string `json:"download_dir"`
 	StaleTimeoutMins int    `json:"stale_timeout_mins"`
-	DockerImage      string `json:"docker_image"`
 }
 
 func DefaultConfig() *Config {
@@ -19,7 +18,6 @@ func DefaultConfig() *Config {
 		MaxConcurrent:    5,
 		DownloadDir:      filepath.Join(homeDir(), "Downloads", "aria-tui"),
 		StaleTimeoutMins: 5,
-		DockerImage:      "aria-tui-vpn:latest",
 	}
 }
 

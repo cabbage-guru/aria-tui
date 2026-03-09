@@ -10,7 +10,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/cabbage-guru/aria-tui/internal/config"
-	"github.com/cabbage-guru/aria-tui/internal/docker"
 	"github.com/cabbage-guru/aria-tui/internal/download"
 	"github.com/cabbage-guru/aria-tui/internal/history"
 	"github.com/cabbage-guru/aria-tui/internal/vpn"
@@ -40,11 +39,10 @@ const (
 type tickMsg time.Time
 
 type Model struct {
-	cfg       *config.Config
-	vpnPool   *vpn.Pool
-	dockerMgr *docker.Manager
-	dlMgr     *download.Manager
-	hist      *history.Store
+	cfg     *config.Config
+	vpnPool *vpn.Pool
+	dlMgr   *download.Manager
+	hist    *history.Store
 
 	activeTab  tab
 	cursor     int
@@ -62,14 +60,13 @@ type Model struct {
 	vpnAddPhase   int // 0 = name, 1 = content
 }
 
-func NewModel(cfg *config.Config, vpnPool *vpn.Pool, dockerMgr *docker.Manager, dlMgr *download.Manager, hist *history.Store) Model {
+func NewModel(cfg *config.Config, vpnPool *vpn.Pool, dlMgr *download.Manager, hist *history.Store) Model {
 	ti := textinput.New()
 	ti.CharLimit = 2048
 
 	return Model{
 		cfg:       cfg,
 		vpnPool:   vpnPool,
-		dockerMgr: dockerMgr,
 		dlMgr:     dlMgr,
 		hist:      hist,
 		textInput: ti,
@@ -684,7 +681,6 @@ func (m Model) renderSettings() string {
 		{"Max Concurrent (m)", fmt.Sprintf("%d", m.cfg.MaxConcurrent), "Maximum simultaneous VPN+download connections"},
 		{"Stale Timeout (s)", fmt.Sprintf("%d minutes", m.cfg.StaleTimeoutMins), "Mark download as stale after no progress"},
 		{"Download Dir", m.cfg.DownloadDir, "Where downloaded files are saved"},
-		{"Docker Image", m.cfg.DockerImage, "Docker image for VPN+aria2c containers"},
 	}
 
 	for i, s := range settings {

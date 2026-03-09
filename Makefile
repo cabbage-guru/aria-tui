@@ -1,13 +1,9 @@
-.PHONY: build build-image run clean install
+.PHONY: build run clean install check
 
 BINARY=aria-tui
-DOCKER_IMAGE=aria-tui-vpn:latest
 
 build:
 	go build -o $(BINARY) ./cmd/aria-tui/
-
-build-image:
-	docker build -t $(DOCKER_IMAGE) docker/
 
 run: build
 	./$(BINARY)
@@ -17,6 +13,9 @@ install: build
 
 clean:
 	rm -f $(BINARY)
+
+check:
+	./$(BINARY) check
 
 # Import all .conf files from a directory
 import-vpn:

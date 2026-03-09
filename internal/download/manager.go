@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/cabbage-guru/aria-tui/internal/config"
-	"github.com/cabbage-guru/aria-tui/internal/docker"
 	"github.com/cabbage-guru/aria-tui/internal/history"
+	"github.com/cabbage-guru/aria-tui/internal/tunnel"
 	"github.com/cabbage-guru/aria-tui/internal/vpn"
 )
 
@@ -49,23 +49,23 @@ func (s Status) String() string {
 
 // Download represents a single download task.
 type Download struct {
-	ID             string
-	URL            string
-	Filename       string
-	Status         Status
-	Error          string
-	VPNConfig      string
-	ContainerName  string
-	GID            string
-	RPCPort        int
-	TotalSize      int64
-	CompletedSize  int64
-	Speed          int64
-	StartedAt      time.Time
-	CompletedAt    time.Time
-	LastProgress   time.Time // last time we saw bytes increase
-	LastBytes      int64     // bytes at last progress check
-	StaleNotified  bool
+	ID            string
+	URL           string
+	Filename      string
+	Status        Status
+	Error         string
+	VPNConfig     string
+	Interface     string // WireGuard interface name
+	GID           string
+	RPCPort       int
+	TotalSize     int64
+	CompletedSize int64
+	Speed         int64
+	StartedAt     time.Time
+	CompletedAt   time.Time
+	LastProgress  time.Time // last time we saw bytes increase
+	LastBytes     int64     // bytes at last progress check
+	StaleNotified bool
 }
 
 func (d *Download) Progress() float64 {
@@ -105,28 +105,28 @@ func formatBytes(b int64) string {
 	}
 }
 
-// Manager coordinates downloads across Docker containers.
+// Manager coordinates downloads across WireGuard tunnels.
 type Manager struct {
 	mu        sync.RWMutex
 	downloads []*Download
 	queue     []string // IDs of queued downloads
 	cfg       *config.Config
 	vpnPool   *vpn.Pool
-	dockerMgr *docker.Manager
+	tunnelMgr *tunnel.Manager
 	hist      *history.Store
 	nextID    int
 	ctx       context.Context
 	cancel    context.CancelFunc
 }
 
-func NewManager(cfg *config.Config, vpnPool *vpn.Pool, dockerMgr *docker.Manager, hist *history.Store) *Manager {
+func NewManager(cfg *config.Config, vpnPool *vpn.Pool, tunnelMgr *tunnel.Manager, hist *history.Store) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
 		downloads: make([]*Download, 0),
 		queue:     make([]string, 0),
 		cfg:       cfg,
 		vpnPool:   vpnPool,
-		dockerMgr: dockerMgr,
+		tunnelMgr: tunnelMgr,
 		hist:      hist,
 		ctx:       ctx,
 		cancel:    cancel,
@@ -159,7 +159,7 @@ func (m *Manager) Start() {
 // Stop cancels all operations and cleans up.
 func (m *Manager) Stop() {
 	m.cancel()
-	m.dockerMgr.StopAll(context.Background())
+	m.tunnelMgr.StopAll(context.Background())
 }
 
 // Downloads returns a copy of all downloads.
@@ -210,7 +210,7 @@ func (m *Manager) Restart(id string) {
 
 	for _, d := range m.downloads {
 		if d.ID == id && (d.Status == StatusStale || d.Status == StatusError) {
-			// Clean up old container
+			// Clean up old tunnel
 			go m.cleanupDownload(d)
 
 			d.Status = StatusQueued
@@ -218,7 +218,7 @@ func (m *Manager) Restart(id string) {
 			d.GID = ""
 			d.RPCPort = 0
 			d.VPNConfig = ""
-			d.ContainerName = ""
+			d.Interface = ""
 			d.StaleNotified = false
 			d.LastProgress = time.Time{}
 			d.LastBytes = 0
@@ -311,13 +311,13 @@ func (m *Manager) processQueue() {
 		return
 	}
 
-	// Start container
-	container, err := m.dockerMgr.StartContainerWithConfig(m.ctx, wgCfg.Name, wgCfg.Contents)
+	// Start WireGuard tunnel + aria2c
+	tun, err := m.tunnelMgr.StartTunnel(m.ctx, wgCfg.Name, wgCfg.Contents)
 	if err != nil {
 		m.vpnPool.Release(wgCfg.Name)
 		m.mu.Lock()
 		dl.Status = StatusError
-		dl.Error = fmt.Sprintf("Container start failed: %v", err)
+		dl.Error = fmt.Sprintf("Tunnel start failed: %v", err)
 		m.mu.Unlock()
 		m.recordHistory(dl)
 		return
@@ -325,14 +325,14 @@ func (m *Manager) processQueue() {
 
 	m.mu.Lock()
 	dl.VPNConfig = wgCfg.Name
-	dl.ContainerName = container.Name
-	dl.RPCPort = container.RPCPort
+	dl.Interface = tun.Interface
+	dl.RPCPort = tun.RPCPort
 	m.mu.Unlock()
 
-	// Wait for aria2c to become ready
-	client := NewAria2Client(container.RPCPort)
+	// Wait for aria2c RPC to become ready
+	client := NewAria2Client(tun.RPCPort)
 	ready := false
-	for i := 0; i < 30; i++ {
+	for i := 0; i < 15; i++ {
 		select {
 		case <-m.ctx.Done():
 			return
@@ -347,10 +347,10 @@ func (m *Manager) processQueue() {
 
 	if !ready {
 		m.vpnPool.Release(wgCfg.Name)
-		m.dockerMgr.StopContainer(m.ctx, wgCfg.Name)
+		m.tunnelMgr.StopTunnel(m.ctx, wgCfg.Name)
 		m.mu.Lock()
 		dl.Status = StatusError
-		dl.Error = "aria2c RPC not ready after 30s"
+		dl.Error = "aria2c RPC not ready after 15s"
 		m.mu.Unlock()
 		m.recordHistory(dl)
 		return
@@ -360,7 +360,7 @@ func (m *Manager) processQueue() {
 	gid, err := client.AddURI(dl.URL)
 	if err != nil {
 		m.vpnPool.Release(wgCfg.Name)
-		m.dockerMgr.StopContainer(m.ctx, wgCfg.Name)
+		m.tunnelMgr.StopTunnel(m.ctx, wgCfg.Name)
 		m.mu.Lock()
 		dl.Status = StatusError
 		dl.Error = fmt.Sprintf("Failed to add URL: %v", err)
@@ -452,7 +452,7 @@ func (m *Manager) updateStatuses() {
 
 func (m *Manager) cleanupDownload(dl *Download) {
 	if dl.VPNConfig != "" {
-		m.dockerMgr.StopContainer(context.Background(), dl.VPNConfig)
+		m.tunnelMgr.StopTunnel(context.Background(), dl.VPNConfig)
 		m.vpnPool.Release(dl.VPNConfig)
 	}
 }
