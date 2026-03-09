@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -31,6 +33,9 @@ func main() {
 		case "check":
 			handleCheck()
 			return
+		case "test":
+			handleTest()
+			return
 		case "help", "--help", "-h":
 			printHelp()
 			return
@@ -49,6 +54,7 @@ Usage:
   aria-tui import-dir <dir>    Import all .conf files from a directory
   aria-tui list-vpn            List all VPN configurations
   aria-tui check               Check that dependencies are installed
+  aria-tui test                Test download through a VPN tunnel
 
 TUI Controls:
   1-4          Switch tabs (Downloads, VPN Pool, History, Settings)
@@ -79,6 +85,126 @@ func handleCheck() {
 		os.Exit(1)
 	}
 	fmt.Println("All dependencies found!")
+}
+
+func handleTest() {
+	// Test URL: small file from a reliable source
+	testURL := "https://speed.cloudflare.com/100kB.bin"
+
+	fmt.Println("=== aria-tui end-to-end test ===")
+	fmt.Println()
+
+	// Step 1: Check dependencies
+	fmt.Print("[1/6] Checking dependencies... ")
+	if err := tunnel.CheckDependencies(); err != nil {
+		fmt.Printf("FAIL\n  %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("OK")
+
+	// Step 2: Load VPN configs
+	fmt.Print("[2/6] Loading VPN configs... ")
+	pool := vpn.NewPool()
+	if err := pool.LoadConfigs(); err != nil {
+		fmt.Printf("FAIL\n  %v\n", err)
+		os.Exit(1)
+	}
+	if pool.Available() == 0 {
+		fmt.Printf("FAIL\n  No VPN configs available. Import some first:\n")
+		fmt.Printf("  aria-tui import <file.conf>\n")
+		os.Exit(1)
+	}
+	fmt.Printf("OK (%d available)\n", pool.Available())
+
+	// Step 3: Acquire a VPN config
+	fmt.Print("[3/6] Acquiring VPN config... ")
+	wgCfg := pool.Acquire()
+	if wgCfg == nil {
+		fmt.Println("FAIL\n  No VPN config could be acquired")
+		os.Exit(1)
+	}
+	fmt.Printf("OK (%s)\n", wgCfg.Name)
+	defer pool.Release(wgCfg.Name)
+
+	// Step 4: Start tunnel
+	fmt.Print("[4/6] Starting WireGuard tunnel + aria2c... ")
+	ctx := context.Background()
+	tmpDir, _ := os.MkdirTemp("", "aria-tui-test-*")
+	defer os.RemoveAll(tmpDir)
+
+	tunnelMgr := tunnel.NewManager(tmpDir)
+	defer tunnelMgr.StopAll(ctx)
+
+	tun, err := tunnelMgr.StartTunnel(ctx, wgCfg.Name, wgCfg.Contents)
+	if err != nil {
+		fmt.Printf("FAIL\n  %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("OK (iface=%s, port=%d)\n", tun.Interface, tun.RPCPort)
+
+	// Step 5: Wait for RPC
+	fmt.Print("[5/6] Waiting for aria2c RPC... ")
+	client := download.NewAria2Client(tun.RPCPort, tunnel.RPCSecret(tun.RPCPort))
+	ready := false
+	for i := 0; i < 20; i++ {
+		if ver, err := client.GetVersion(); err == nil {
+			fmt.Printf("OK (aria2 v%s)\n", ver)
+			ready = true
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	if !ready {
+		// Read aria2c log for diagnostics
+		errMsg := "aria2c RPC not ready after 20s"
+		if tun.Aria2Log != "" {
+			if logData, readErr := os.ReadFile(tun.Aria2Log); readErr == nil {
+				if out := strings.TrimSpace(string(logData)); out != "" {
+					errMsg += "\n  aria2c output: " + out
+				}
+			}
+		}
+		fmt.Printf("FAIL\n  %s\n", errMsg)
+		os.Exit(1)
+	}
+
+	// Step 6: Download test file
+	fmt.Printf("[6/6] Downloading test file (%s)... ", testURL)
+	gid, err := client.AddURI(testURL)
+	if err != nil {
+		fmt.Printf("FAIL\n  AddURI error: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Poll until complete or error (max 60s)
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(time.Second)
+		status, err := client.TellStatus(gid)
+		if err != nil {
+			continue
+		}
+		switch status.Status {
+		case "complete":
+			filename := ""
+			if len(status.Files) > 0 && status.Files[0].Path != "" {
+				filename = filepath.Base(status.Files[0].Path)
+			}
+			fmt.Printf("OK\n")
+			fmt.Println()
+			fmt.Println("=== Test passed! ===")
+			fmt.Printf("  File:      %s\n", filename)
+			fmt.Printf("  Size:      %d bytes\n", status.CompletedLength)
+			fmt.Printf("  Interface: %s\n", tun.Interface)
+			fmt.Printf("  VPN:       %s\n", wgCfg.Name)
+			return
+		case "error":
+			fmt.Printf("FAIL\n  aria2c error: [%s] %s\n", status.ErrorCode, status.ErrorMessage)
+			os.Exit(1)
+		}
+	}
+	fmt.Println("FAIL\n  Download timed out after 60s")
+	os.Exit(1)
 }
 
 func handleImport() {

@@ -498,9 +498,11 @@ func configureInterface(ctx context.Context, iface string, confFile string, addr
 func startAria2c(ctx context.Context, iface string, port int, downloadDir string) (*exec.Cmd, string, error) {
 	args := []string{
 		"--enable-rpc=true",
-		"--rpc-listen-all=true",
+		"--rpc-listen-all=false",
 		fmt.Sprintf("--rpc-listen-port=%d", port),
 		"--rpc-allow-origin-all=true",
+		"--disable-ipv6=true",
+		fmt.Sprintf("--rpc-secret=%s", rpcSecret(port)),
 		fmt.Sprintf("--dir=%s", downloadDir),
 		fmt.Sprintf("--interface=%s", iface),
 		fmt.Sprintf("--file-allocation=%s", fileAllocMethod()),
@@ -556,6 +558,16 @@ func startAria2c(ctx context.Context, iface string, port int, downloadDir string
 	aria2Log.Close()
 
 	return cmd, logPath, nil
+}
+
+// RPCSecret returns the RPC secret token for a given port.
+// Deterministic so the client can compute it without storing state.
+func RPCSecret(port int) string {
+	return rpcSecret(port)
+}
+
+func rpcSecret(port int) string {
+	return fmt.Sprintf("aria-tui-%d", port)
 }
 
 func fileAllocMethod() string {

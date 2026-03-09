@@ -12,6 +12,7 @@ import (
 // Aria2Client communicates with aria2c via JSON-RPC.
 type Aria2Client struct {
 	url    string
+	secret string
 	client *http.Client
 }
 
@@ -89,9 +90,10 @@ func (s *Aria2Status) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func NewAria2Client(port int) *Aria2Client {
+func NewAria2Client(port int, secret string) *Aria2Client {
 	return &Aria2Client{
-		url: fmt.Sprintf("http://127.0.0.1:%d/jsonrpc", port),
+		url:    fmt.Sprintf("http://127.0.0.1:%d/jsonrpc", port),
+		secret: secret,
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -99,6 +101,10 @@ func NewAria2Client(port int) *Aria2Client {
 }
 
 func (c *Aria2Client) call(method string, params ...interface{}) (json.RawMessage, error) {
+	// Prepend RPC secret token as first parameter
+	if c.secret != "" {
+		params = append([]interface{}{fmt.Sprintf("token:%s", c.secret)}, params...)
+	}
 	if params == nil {
 		params = []interface{}{}
 	}

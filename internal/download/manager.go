@@ -332,7 +332,7 @@ func (m *Manager) processQueue() {
 	m.mu.Unlock()
 
 	// Wait for aria2c RPC to become ready
-	client := NewAria2Client(tun.RPCPort)
+	client := NewAria2Client(tun.RPCPort, tunnel.RPCSecret(tun.RPCPort))
 	ready := false
 	for i := 0; i < 15; i++ {
 		select {
@@ -412,7 +412,7 @@ func (m *Manager) updateStatuses() {
 	m.mu.RUnlock()
 
 	for _, dl := range active {
-		client := NewAria2Client(dl.RPCPort)
+		client := NewAria2Client(dl.RPCPort, tunnel.RPCSecret(dl.RPCPort))
 		status, err := client.TellStatus(dl.GID)
 		if err != nil {
 			continue
