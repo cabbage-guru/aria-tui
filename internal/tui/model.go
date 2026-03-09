@@ -530,7 +530,12 @@ func (m Model) renderDownloads() string {
 			url = url[:maxURL-3] + "..."
 		}
 
-		line := fmt.Sprintf("%s%s %s", prefix, statusStr, url)
+		displayName := url
+		if dl.Filename != "" {
+			displayName = fmt.Sprintf("%s  (%s)", dl.Filename, url)
+		}
+
+		line := fmt.Sprintf("%s%s %s", prefix, statusStr, displayName)
 		if i == m.cursor {
 			line = selectedStyle.Render(line)
 		}
@@ -544,9 +549,6 @@ func (m Model) renderDownloads() string {
 				dl.CompletedStr(), dl.TotalStr(),
 				dl.SpeedStr(),
 				dl.VPNConfig)
-			if dl.Filename != "" {
-				info += fmt.Sprintf("  File: %s", dl.Filename)
-			}
 			b.WriteString(progressBarStyle.Render(info) + "\n")
 		}
 
@@ -650,8 +652,13 @@ func (m Model) renderHistory() string {
 			url = url[:maxURL-3] + "..."
 		}
 
+		displayName := url
+		if e.Filename != "" {
+			displayName = fmt.Sprintf("%s  (%s)", e.Filename, url)
+		}
+
 		timeStr := e.StartedAt.Format("2006-01-02 15:04")
-		line := fmt.Sprintf("%s%s %s  %s  VPN: %s", prefix, statusStr, url, timeStr, e.VPNConfig)
+		line := fmt.Sprintf("%s%s %s  %s  VPN: %s", prefix, statusStr, displayName, timeStr, e.VPNConfig)
 
 		if i == m.cursor {
 			line = selectedStyle.Render(line)
