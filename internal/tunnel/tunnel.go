@@ -275,6 +275,7 @@ func startWireGuardGo(ctx context.Context, ifaceName string) (*exec.Cmd, string,
 	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("wg-tun-%s-%d", ifaceName, time.Now().UnixNano()))
 	cmd.Env = append(os.Environ(),
 		fmt.Sprintf("WG_TUN_NAME_FILE=%s", tmpFile),
+		"WG_PROCESS_FOREGROUND=1",
 		"LOG_LEVEL=debug",
 	)
 
