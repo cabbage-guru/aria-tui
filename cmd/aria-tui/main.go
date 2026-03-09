@@ -194,8 +194,8 @@ func handleTest() {
 		fmt.Printf("%s\n", hostIP)
 	}
 
-	// Direct proxy test - bypasses aria2c entirely to verify proxy+IP_BOUND_IF works
-	fmt.Print("[7/10] Direct proxy IP check (tunnel 1)... ")
+	// Test 1: Direct proxy test (IP_BOUND_IF + scoped routes)
+	fmt.Print("[7/12] Direct proxy IP check (tunnel 1)... ")
 	directIP1, directErr1 := getIPViaProxy(tun1.Proxy.Port(), ipCheckURL)
 	if directErr1 != nil {
 		fmt.Printf("FAIL: %v\n", directErr1)
@@ -211,7 +211,18 @@ func handleTest() {
 		fmt.Printf("%s\n", directIP2)
 	}
 
-	fmt.Print("[8/10] Checking external IP via aria2c (tunnel 1)... ")
+	// Test 2: Global routes test (wg-quick approach) on tunnel 1 only
+	// This tests whether the tunnel can carry traffic at all
+	fmt.Print("[8/12] Testing tunnel 1 with global routes (wg-quick style)... ")
+	globalRouteIP := testGlobalRoutes(tun1.Interface, ipCheckURL)
+	fmt.Printf("%s\n", globalRouteIP)
+
+	// Test 3: curl --interface test
+	fmt.Print("[9/12] Testing curl --interface utun10... ")
+	curlIP := testCurlInterface(tun1.Interface, ipCheckURL)
+	fmt.Printf("%s\n", curlIP)
+
+	fmt.Print("[10/12] Checking external IP via aria2c (tunnel 1)... ")
 	ip1, err := getExternalIP(client1, ipCheckURL, tmpDir1)
 	if err != nil {
 		fmt.Printf("FAIL\n  %v\n", err)
@@ -270,7 +281,7 @@ func handleTest() {
 	printDiagnostics(tun1.Interface, tun2.Interface)
 
 	// Step 8: Download test file through both tunnels
-	fmt.Printf("\n[9/10] Downloading test file through tunnel 1... ")
+	fmt.Printf("\n[11/12] Downloading test file through tunnel 1... ")
 	if err := testDownload(client1, testURL); err != nil {
 		fmt.Printf("FAIL\n  %v\n", err)
 		os.Exit(1)
@@ -326,6 +337,77 @@ func getIPViaProxy(proxyPort int, checkURL string) (string, error) {
 	return strings.TrimSpace(string(body)), nil
 }
 
+// testGlobalRoutes temporarily adds non-scoped global routes (wg-quick approach)
+// for a single tunnel to verify the WireGuard tunnel can carry traffic at all.
+func testGlobalRoutes(iface string, checkURL string) string {
+	// Get current default gateway
+	out, err := exec.Command("route", "-n", "get", "default").CombinedOutput()
+	if err != nil {
+		return fmt.Sprintf("FAIL (route get default: %v)", err)
+	}
+	var defaultGW string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "gateway:") {
+			defaultGW = strings.TrimSpace(strings.TrimPrefix(line, "gateway:"))
+		}
+	}
+	if defaultGW == "" {
+		return fmt.Sprintf("FAIL (no default gateway found)\n  route get output:\n%s", string(out))
+	}
+
+	// Get WireGuard endpoint for this interface
+	wgOut, err := exec.Command("sudo", "wg", "show", iface, "endpoints").CombinedOutput()
+	if err != nil {
+		return fmt.Sprintf("FAIL (wg show endpoints: %v)", err)
+	}
+	var endpointIP string
+	for _, line := range strings.Split(string(wgOut), "\n") {
+		parts := strings.Fields(line)
+		if len(parts) >= 2 {
+			ep := parts[1]
+			if idx := strings.LastIndex(ep, ":"); idx > 0 {
+				endpointIP = ep[:idx]
+			}
+		}
+	}
+
+	// Add endpoint exclusion route (so WG encrypted packets still reach the endpoint)
+	if endpointIP != "" {
+		exec.Command("sudo", "route", "add", "-host", endpointIP, defaultGW).Run()
+		defer exec.Command("sudo", "route", "delete", "-host", endpointIP).Run()
+	}
+
+	// Add global split-default routes
+	exec.Command("sudo", "route", "add", "-net", "0.0.0.0/1", "-interface", iface).Run()
+	exec.Command("sudo", "route", "add", "-net", "128.0.0.0/1", "-interface", iface).Run()
+	defer exec.Command("sudo", "route", "delete", "-net", "0.0.0.0/1", "-interface", iface).Run()
+	defer exec.Command("sudo", "route", "delete", "-net", "128.0.0.0/1", "-interface", iface).Run()
+
+	// Now try to get external IP - ALL traffic should go through the tunnel
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get(checkURL)
+	if err != nil {
+		return fmt.Sprintf("FAIL (http get: %v) [gw=%s, ep=%s]", err, defaultGW, endpointIP)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	ip := strings.TrimSpace(string(body))
+
+	// Also show WG transfer after test
+	wgOut2, _ := exec.Command("sudo", "wg", "show", iface, "transfer").CombinedOutput()
+	return fmt.Sprintf("%s [gw=%s, ep=%s, wg_transfer=%s]", ip, defaultGW, endpointIP, strings.TrimSpace(string(wgOut2)))
+}
+
+// testCurlInterface uses curl --interface to test interface binding.
+func testCurlInterface(iface string, checkURL string) string {
+	out, err := exec.Command("curl", "-s", "--max-time", "10", "--interface", iface, checkURL).CombinedOutput()
+	if err != nil {
+		return fmt.Sprintf("FAIL (%v: %s)", err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // getHostExternalIP fetches the host's external IP directly (no tunnel).
 func getHostExternalIP(checkURL string) (string, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -343,6 +425,14 @@ func getHostExternalIP(checkURL string) (string, error) {
 
 // printDiagnostics dumps routing and WireGuard state for debugging.
 func printDiagnostics(ifaces ...string) {
+	// Show default route
+	fmt.Println("  route -n get default:")
+	if out, err := exec.Command("route", "-n", "get", "default").CombinedOutput(); err == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			fmt.Printf("    %s\n", line)
+		}
+	}
+
 	// Show WireGuard status
 	fmt.Println("  wg show:")
 	if out, err := exec.Command("sudo", "wg", "show").CombinedOutput(); err == nil {
