@@ -261,13 +261,13 @@ func sanitize(s string) string {
 func startWireGuardGo(ctx context.Context, ifaceName string) (*exec.Cmd, string, error) {
 	cmd := exec.CommandContext(ctx, "wireguard-go", ifaceName)
 
-	// Capture stderr to get the actual interface name on macOS
+	// Capture stderr to parse the actual interface name
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		return nil, "", err
 	}
 
-	// Set WG_TUN_NAME_FILE to get the actual interface name
+	// WG_TUN_NAME_FILE: wireguard-go writes the actual interface name here
 	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("wg-tun-%s-%d", ifaceName, time.Now().UnixNano()))
 	cmd.Env = append(os.Environ(), fmt.Sprintf("WG_TUN_NAME_FILE=%s", tmpFile))
 
@@ -275,39 +275,86 @@ func startWireGuardGo(ctx context.Context, ifaceName string) (*exec.Cmd, string,
 		return nil, "", fmt.Errorf("failed to start wireguard-go: %w", err)
 	}
 
-	// Read first line of stderr for interface name or errors
-	scanner := bufio.NewScanner(stderrPipe)
+	// Read stderr in a goroutine to avoid blocking
+	stderrLines := make(chan string, 10)
+	go func() {
+		scanner := bufio.NewScanner(stderrPipe)
+		for scanner.Scan() {
+			stderrLines <- scanner.Text()
+		}
+		close(stderrLines)
+	}()
+
 	actualIface := ifaceName
 
-	// Give it a moment to start
-	time.Sleep(200 * time.Millisecond)
+	// Wait for wireguard-go to create the interface (up to 5 seconds)
+	for i := 0; i < 50; i++ {
+		time.Sleep(100 * time.Millisecond)
 
-	// Try to read the interface name from the file wireguard-go creates
-	if data, err := os.ReadFile(tmpFile); err == nil {
-		actual := strings.TrimSpace(string(data))
-		if actual != "" {
-			actualIface = actual
-		}
-		os.Remove(tmpFile)
-	} else if scanner.Scan() {
-		line := scanner.Text()
-		// wireguard-go on macOS prints something like "INFO: (utun3) ..."
-		if idx := strings.Index(line, "("); idx >= 0 {
-			if end := strings.Index(line[idx:], ")"); end >= 0 {
-				actualIface = line[idx+1 : idx+end]
+		// Check WG_TUN_NAME_FILE first (most reliable)
+		if data, err := os.ReadFile(tmpFile); err == nil {
+			actual := strings.TrimSpace(string(data))
+			if actual != "" {
+				actualIface = actual
+				os.Remove(tmpFile)
+				break
 			}
+		}
+
+		// Also check stderr output for interface name
+		select {
+		case line := <-stderrLines:
+			// wireguard-go prints "INFO: (utun3) ..." or similar
+			if idx := strings.Index(line, "("); idx >= 0 {
+				if end := strings.Index(line[idx:], ")"); end >= 0 {
+					actualIface = line[idx+1 : idx+end]
+				}
+			}
+		default:
+		}
+
+		// Check if the UAPI socket exists (means wireguard-go is ready)
+		socketPath := fmt.Sprintf("/var/run/wireguard/%s.sock", actualIface)
+		if runtime.GOOS == "darwin" {
+			socketPath = fmt.Sprintf("/var/run/wireguard/%s.sock", actualIface)
+		}
+		if _, err := os.Stat(socketPath); err == nil {
+			break
 		}
 	}
 
+	os.Remove(tmpFile) // clean up in case we broke out via socket check
+
+	// Final verification: make sure the UAPI socket is there
+	socketPath := fmt.Sprintf("/var/run/wireguard/%s.sock", actualIface)
+	for i := 0; i < 10; i++ {
+		if _, err := os.Stat(socketPath); err == nil {
+			return cmd, actualIface, nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// Even if socket isn't found, return what we have — wg setconf will
+	// retry below anyway
 	return cmd, actualIface, nil
 }
 
 // configureInterface sets up the WireGuard interface with wg and assigns IP.
 func configureInterface(ctx context.Context, iface string, confFile string, address string) error {
-	// Apply WireGuard configuration
-	cmd := exec.CommandContext(ctx, "wg", "setconf", iface, confFile)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("wg setconf: %s: %w", strings.TrimSpace(string(out)), err)
+	// Apply WireGuard configuration, retrying since wireguard-go may still be initializing
+	var lastErr error
+	for attempt := 0; attempt < 10; attempt++ {
+		cmd := exec.CommandContext(ctx, "wg", "setconf", iface, confFile)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			lastErr = nil
+			break
+		}
+		lastErr = fmt.Errorf("wg setconf: %s: %w", strings.TrimSpace(string(out)), err)
+		time.Sleep(500 * time.Millisecond)
+	}
+	if lastErr != nil {
+		return lastErr
 	}
 
 	// Parse address for IP assignment
@@ -325,34 +372,33 @@ func configureInterface(ctx context.Context, iface string, confFile string, addr
 	switch runtime.GOOS {
 	case "darwin":
 		// macOS: ifconfig utunX inet <ip> <ip> (point-to-point)
-		cmd = exec.CommandContext(ctx, "ifconfig", iface, "inet", ip.String(), ip.String())
-		if out, err := cmd.CombinedOutput(); err != nil {
+		ifCmd := exec.CommandContext(ctx, "ifconfig", iface, "inet", ip.String(), ip.String())
+		if out, err := ifCmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("ifconfig: %s: %w", strings.TrimSpace(string(out)), err)
 		}
 
-		// Add route for all traffic through this interface
-		// We use a specific route to avoid messing with the default route
-		cmd = exec.CommandContext(ctx, "ifconfig", iface, "mtu", "1420")
-		cmd.Run() // best effort
+		// Set MTU
+		mtuCmd := exec.CommandContext(ctx, "ifconfig", iface, "mtu", "1420")
+		mtuCmd.Run() // best effort
 
 	case "linux":
 		// Linux: ip addr add <cidr> dev <iface>
 		ones, _ := ipNet.Mask.Size()
 		cidr := fmt.Sprintf("%s/%d", ip.String(), ones)
-		cmd = exec.CommandContext(ctx, "ip", "addr", "add", cidr, "dev", iface)
-		if out, err := cmd.CombinedOutput(); err != nil {
+		addrCmd := exec.CommandContext(ctx, "ip", "addr", "add", cidr, "dev", iface)
+		if out, err := addrCmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("ip addr add: %s: %w", strings.TrimSpace(string(out)), err)
 		}
 
 		// Bring interface up
-		cmd = exec.CommandContext(ctx, "ip", "link", "set", iface, "up")
-		if out, err := cmd.CombinedOutput(); err != nil {
+		upCmd := exec.CommandContext(ctx, "ip", "link", "set", iface, "up")
+		if out, err := upCmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("ip link set up: %s: %w", strings.TrimSpace(string(out)), err)
 		}
 
 		// Set MTU
-		cmd = exec.CommandContext(ctx, "ip", "link", "set", iface, "mtu", "1420")
-		cmd.Run() // best effort
+		mtuCmd := exec.CommandContext(ctx, "ip", "link", "set", iface, "mtu", "1420")
+		mtuCmd.Run() // best effort
 	}
 
 	return nil
