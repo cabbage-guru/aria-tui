@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"net"
 	"net/netip"
 	"strings"
@@ -33,9 +34,10 @@ func NewUserspaceWG(config string) (*UserspaceWG, error) {
 
 	dnsAddrs := parseDNSAddrs(config)
 	if len(dnsAddrs) == 0 {
-		// Default DNS
 		dnsAddrs = []netip.Addr{netip.MustParseAddr("1.1.1.1")}
 	}
+
+	log.Printf("[wg-userspace] creating netstack TUN (addr=%s, dns=%v)", localAddr, dnsAddrs)
 
 	// Create userspace TUN backed by netstack (gvisor TCP/IP stack)
 	tun, tnet, err := netstack.CreateNetTUN(
@@ -47,8 +49,10 @@ func NewUserspaceWG(config string) (*UserspaceWG, error) {
 		return nil, fmt.Errorf("create netstack tun: %w", err)
 	}
 
+	log.Printf("[wg-userspace] creating WireGuard device")
+
 	// Create WireGuard device
-	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(device.LogLevelError, "wg: "))
+	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(device.LogLevelVerbose, "wg: "))
 
 	// Convert .conf to IPC format and apply
 	ipcConf, err := confToIPC(config)
@@ -57,15 +61,21 @@ func NewUserspaceWG(config string) (*UserspaceWG, error) {
 		return nil, fmt.Errorf("convert config to IPC: %w", err)
 	}
 
+	log.Printf("[wg-userspace] applying IPC config")
+
 	if err := dev.IpcSet(ipcConf); err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("ipc set: %w", err)
 	}
 
+	log.Printf("[wg-userspace] bringing device up")
+
 	if err := dev.Up(); err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("device up: %w", err)
 	}
+
+	log.Printf("[wg-userspace] device up, tunnel ready")
 
 	return &UserspaceWG{
 		device: dev,
