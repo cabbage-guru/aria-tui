@@ -89,7 +89,7 @@ func handleCheck() {
 
 func handleTest() {
 	// Test URL: small file from a reliable source
-	testURL := "https://speed.cloudflare.com/100kB.bin"
+	testURL := "https://hil-speed.hetzner.com/100MB.bin"
 
 	fmt.Println("=== aria-tui end-to-end test ===")
 	fmt.Println()
