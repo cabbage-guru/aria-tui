@@ -13,12 +13,15 @@ import (
 	"sync/atomic"
 )
 
+// DialFunc is a function that dials a network connection.
+type DialFunc func(ctx context.Context, network, address string) (net.Conn, error)
+
 // ConnectProxy is an HTTP CONNECT proxy that routes all connections through
-// a specific network interface using OS-level socket binding
-// (IP_BOUND_IF on macOS, SO_BINDTODEVICE on Linux).
+// a custom dial function (e.g., a userspace WireGuard tunnel).
 type ConnectProxy struct {
 	listener    net.Listener
-	iface       string
+	dialFn      DialFunc
+	label       string
 	port        int
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -30,8 +33,8 @@ type ConnectProxy struct {
 }
 
 // StartConnectProxy starts an HTTP CONNECT proxy on a free port that routes all
-// connections through the given network interface.
-func StartConnectProxy(parentCtx context.Context, iface string, logger *log.Logger) (*ConnectProxy, error) {
+// connections through the given dial function.
+func StartConnectProxy(parentCtx context.Context, label string, dialFn DialFunc, logger *log.Logger) (*ConnectProxy, error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, fmt.Errorf("listen: %w", err)
@@ -46,7 +49,8 @@ func StartConnectProxy(parentCtx context.Context, iface string, logger *log.Logg
 
 	p := &ConnectProxy{
 		listener: listener,
-		iface:    iface,
+		dialFn:   dialFn,
+		label:    label,
 		port:     port,
 		ctx:      ctx,
 		cancel:   cancel,
@@ -56,7 +60,7 @@ func StartConnectProxy(parentCtx context.Context, iface string, logger *log.Logg
 	p.wg.Add(1)
 	go p.serve()
 
-	logger.Printf("[proxy:%s:%d] started HTTP CONNECT proxy", iface, port)
+	logger.Printf("[proxy:%s:%d] started HTTP CONNECT proxy", label, port)
 	return p, nil
 }
 
@@ -77,7 +81,7 @@ func (p *ConnectProxy) Stop() {
 	p.wg.Wait()
 	total, success, fail := p.Stats()
 	p.logger.Printf("[proxy:%s:%d] stopped (conns: %d, dial_ok: %d, dial_fail: %d)",
-		p.iface, p.port, total, success, fail)
+		p.label, p.port, total, success, fail)
 }
 
 func (p *ConnectProxy) serve() {
@@ -104,12 +108,12 @@ func (p *ConnectProxy) handleConn(clientConn net.Conn) {
 	br := bufio.NewReader(clientConn)
 	req, err := http.ReadRequest(br)
 	if err != nil {
-		p.logger.Printf("[proxy:%s] failed to read request: %v", p.iface, err)
+		p.logger.Printf("[proxy:%s] failed to read request: %v", p.label, err)
 		return
 	}
 
 	if req.Method != http.MethodConnect {
-		p.logger.Printf("[proxy:%s] non-CONNECT method: %s %s", p.iface, req.Method, req.URL)
+		p.logger.Printf("[proxy:%s] non-CONNECT method: %s %s", p.label, req.Method, req.URL)
 		clientConn.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\n\r\n"))
 		return
 	}
@@ -119,17 +123,13 @@ func (p *ConnectProxy) handleConn(clientConn net.Conn) {
 		target = target + ":443"
 	}
 
-	p.logger.Printf("[proxy:%s] CONNECT %s", p.iface, target)
+	p.logger.Printf("[proxy:%s] CONNECT %s", p.label, target)
 
-	// Connect through the bound interface
-	dialer := &net.Dialer{
-		Control: bindToInterfaceControl(p.iface),
-	}
-
-	remoteConn, err := dialer.DialContext(p.ctx, "tcp", target)
+	// Connect through the tunnel
+	remoteConn, err := p.dialFn(p.ctx, "tcp", target)
 	if err != nil {
 		p.dialFail.Add(1)
-		p.logger.Printf("[proxy:%s] dial %s failed: %v", p.iface, target, err)
+		p.logger.Printf("[proxy:%s] dial %s failed: %v", p.label, target, err)
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
@@ -137,7 +137,7 @@ func (p *ConnectProxy) handleConn(clientConn net.Conn) {
 	p.dialSuccess.Add(1)
 
 	localAddr := remoteConn.LocalAddr()
-	p.logger.Printf("[proxy:%s] connected %s -> %s (local: %s)", p.iface, target, remoteConn.RemoteAddr(), localAddr)
+	p.logger.Printf("[proxy:%s] connected %s -> %s (local: %s)", p.label, target, remoteConn.RemoteAddr(), localAddr)
 
 	// Tell client the tunnel is established
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))

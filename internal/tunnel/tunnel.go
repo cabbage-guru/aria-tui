@@ -4,39 +4,33 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
-// Tunnel represents an active WireGuard tunnel with an interface.
+// Tunnel represents an active WireGuard tunnel.
 type Tunnel struct {
-	Name       string
-	Interface  string // e.g. utun5, wg0
-	VPNConfig  string
-	RPCPort    int
-	Aria2Cmd   *exec.Cmd
-	Aria2Log   string // path to aria2c log file for debugging
-	WGCmd      *exec.Cmd // wireguard-go process
-	Proxy *ConnectProxy // HTTP CONNECT proxy that routes through this tunnel
-	Created    time.Time
-	cancel     context.CancelFunc
-	routeTable int    // Linux routing table ID for policy routing
-	fwmark     int    // fwmark value for this tunnel
+	Name      string
+	Interface string // "userspace" for netstack tunnels, or e.g. utun5, wg0
+	VPNConfig string
+	RPCPort   int
+	Aria2Cmd  *exec.Cmd
+	Aria2Log  string          // path to aria2c log file for debugging
+	Proxy     *ConnectProxy   // HTTP CONNECT proxy that routes through this tunnel
+	WG        *UserspaceWG    // userspace WireGuard tunnel (netstack)
+	Created   time.Time
+	cancel    context.CancelFunc
 }
 
-// Manager handles WireGuard tunnel lifecycle without Docker.
+// Manager handles WireGuard tunnel lifecycle.
 type Manager struct {
 	mu          sync.Mutex
 	tunnels     map[string]*Tunnel
 	nextPort    int
-	nextTableID int // Linux routing table ID (starting at 51820)
 	downloadDir string
 }
 
@@ -44,7 +38,6 @@ func NewManager(downloadDir string) *Manager {
 	return &Manager{
 		tunnels:     make(map[string]*Tunnel),
 		nextPort:    6800,
-		nextTableID: 51820,
 		downloadDir: downloadDir,
 	}
 }
@@ -58,154 +51,66 @@ func (m *Manager) SetDownloadDir(dir string) {
 
 // CheckDependencies verifies that required tools are installed.
 func CheckDependencies() error {
-	required := []string{"wg", "aria2c"}
-
-	// wireguard-go is needed on macOS; on Linux kernel WireGuard may suffice
-	// but we'll use wireguard-go for portability
-	required = append(required, "wireguard-go")
-
-	var missing []string
-	for _, tool := range required {
-		if _, err := exec.LookPath(tool); err != nil {
-			missing = append(missing, tool)
+	if _, err := exec.LookPath("aria2c"); err != nil {
+		switch runtime.GOOS {
+		case "darwin":
+			return fmt.Errorf("aria2c not found. Install with: brew install aria2")
+		case "linux":
+			return fmt.Errorf("aria2c not found. Install with: sudo apt install aria2")
+		default:
+			return fmt.Errorf("aria2c not found")
 		}
-	}
-
-	if len(missing) > 0 {
-		hint := installHint(missing)
-		return fmt.Errorf("missing required tools: %s\n%s", strings.Join(missing, ", "), hint)
 	}
 	return nil
 }
 
-func installHint(missing []string) string {
-	switch runtime.GOOS {
-	case "darwin":
-		return "Install with: brew install wireguard-go wireguard-tools aria2"
-	case "linux":
-		return "Install with: sudo apt install wireguard-tools wireguard-go aria2\n" +
-			"  Or: sudo pacman -S wireguard-tools aria2"
-	default:
-		return "Please install: wireguard-go, wireguard-tools, aria2"
-	}
-}
-
-// StartTunnel creates a WireGuard interface, configures it, and starts aria2c bound to it.
+// StartTunnel creates a userspace WireGuard tunnel via netstack and starts aria2c
+// routed through it via an HTTP CONNECT proxy.
+// No kernel interfaces, no routing tables, no sudo needed for WireGuard.
 func (m *Manager) StartTunnel(ctx context.Context, name string, wgConfigContents string) (*Tunnel, error) {
 	m.mu.Lock()
 	port := m.nextPort
 	m.nextPort++
-	tableID := m.nextTableID
-	m.nextTableID++
 	m.mu.Unlock()
-
-	fwmark := tableID // use same value for simplicity
 
 	tunnelCtx, cancel := context.WithCancel(ctx)
 
-	// Parse the WireGuard config to extract Address
-	address := parseAddress(wgConfigContents)
-	if address == "" {
-		cancel()
-		return nil, fmt.Errorf("could not parse Address from WireGuard config")
-	}
-
-	// Generate interface name
-	ifaceName := m.generateIfaceName(name)
-
-	// Write config to a temp file (wg setconf needs a file)
-	// Strip [Interface] Address and DNS lines since wg setconf doesn't understand them
-	strippedConfig := stripInterfaceExtras(wgConfigContents)
-	confFile, err := writeTempConfig(name, strippedConfig)
+	// Create userspace WireGuard tunnel (netstack - no kernel interface needed)
+	wg, err := NewUserspaceWG(wgConfigContents)
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("writing temp config: %w", err)
+		return nil, fmt.Errorf("creating userspace WG tunnel: %w", err)
 	}
 
-	// Start wireguard-go
-	wgCmd, actualIface, err := startWireGuardGo(tunnelCtx, ifaceName)
-	if err != nil {
-		cancel()
-		os.Remove(confFile)
-		return nil, fmt.Errorf("starting wireguard-go: %w", err)
-	}
-
-	killWg := func() {
-		if wgCmd.Process != nil {
-			if needsSudo() {
-				sudoCmdNoCtx("kill", fmt.Sprintf("%d", wgCmd.Process.Pid)).Run()
-			} else {
-				wgCmd.Process.Kill()
-			}
-		}
-	}
-
-	// Configure the interface with wg setconf
-	if err := configureInterface(tunnelCtx, actualIface, confFile, address); err != nil {
-		killWg()
-		cancel()
-		removeInterface(actualIface)
-		os.Remove(confFile)
-		return nil, fmt.Errorf("configuring interface: %w", err)
-	}
-	os.Remove(confFile) // no longer needed
-
-	// Parse the local IP from the address for routing and aria2c binding
-	parsedIP, _, _ := net.ParseCIDR(address)
-	if parsedIP == nil {
-		parsedIP = net.ParseIP(address)
-	}
-	localIP := ""
-	if parsedIP != nil {
-		localIP = parsedIP.String()
-	}
-
-	// Set up policy routing so traffic through this interface uses the VPN
-	allowedIPs := parseAllowedIPs(wgConfigContents)
-	if len(allowedIPs) > 0 {
-		if err := setupRouting(tunnelCtx, actualIface, localIP, allowedIPs, tableID, fwmark); err != nil {
-			killWg()
-			cancel()
-			removeInterface(actualIface)
-			return nil, fmt.Errorf("setting up routing: %w", err)
-		}
-	}
-
-	// Start an HTTP CONNECT proxy that forces connections through the WireGuard
-	// interface using IP_BOUND_IF (macOS) or SO_BINDTODEVICE (Linux).
+	// Start HTTP CONNECT proxy that dials through the userspace WG tunnel
 	proxyLogger := log.New(os.Stderr, "", log.LstdFlags)
-	proxy, err := StartConnectProxy(tunnelCtx, actualIface, proxyLogger)
+	proxy, err := StartConnectProxy(tunnelCtx, name, wg.DialContext, proxyLogger)
 	if err != nil {
-		cleanupRouting(actualIface, tableID, fwmark)
-		killWg()
+		wg.Close()
 		cancel()
-		removeInterface(actualIface)
 		return nil, fmt.Errorf("starting proxy: %w", err)
 	}
 
+	// Start aria2c routed through the proxy
 	aria2Cmd, aria2LogPath, err := startAria2c(tunnelCtx, proxy.Port(), port, m.downloadDir)
 	if err != nil {
 		proxy.Stop()
-		cleanupRouting(actualIface, tableID, fwmark)
-		killWg()
+		wg.Close()
 		cancel()
-		removeInterface(actualIface)
 		return nil, fmt.Errorf("starting aria2c: %w", err)
 	}
 
 	t := &Tunnel{
-		Name:       name,
-		Interface:  actualIface,
-		VPNConfig:  name,
-		RPCPort:    port,
-		Aria2Cmd:   aria2Cmd,
-		Aria2Log:   aria2LogPath,
-		WGCmd:      wgCmd,
-		Proxy:      proxy,
-		Created:    time.Now(),
-		cancel:     cancel,
-		routeTable: tableID,
-		fwmark:     fwmark,
+		Name:      name,
+		Interface: "userspace",
+		VPNConfig: name,
+		RPCPort:   port,
+		Aria2Cmd:  aria2Cmd,
+		Aria2Log:  aria2LogPath,
+		Proxy:     proxy,
+		WG:        wg,
+		Created:   time.Now(),
+		cancel:    cancel,
 	}
 
 	m.mu.Lock()
@@ -246,24 +151,10 @@ func stopTunnel(t *Tunnel) error {
 		t.Proxy.Stop()
 	}
 
-	// Kill wireguard-go (may be running as root via sudo)
-	if t.WGCmd != nil && t.WGCmd.Process != nil {
-		if needsSudo() {
-			// sudo process: use sudo kill since we don't own it
-			sudoCmdNoCtx("kill", fmt.Sprintf("%d", t.WGCmd.Process.Pid)).Run()
-		} else {
-			t.WGCmd.Process.Kill()
-		}
-		t.WGCmd.Wait()
+	// Close userspace WireGuard
+	if t.WG != nil {
+		t.WG.Close()
 	}
-
-	// Clean up policy routing
-	if t.routeTable != 0 {
-		cleanupRouting(t.Interface, t.routeTable, t.fwmark)
-	}
-
-	// Remove the interface
-	removeInterface(t.Interface)
 
 	// Clean up aria2c log
 	if t.Aria2Log != "" {
@@ -312,353 +203,7 @@ func (m *Manager) IsRunning(name string) bool {
 	return false
 }
 
-func (m *Manager) generateIfaceName(name string) string {
-	if runtime.GOOS == "darwin" {
-		// macOS uses utun interfaces; wireguard-go will auto-assign
-		return "utun"
-	}
-	// Linux: use wg-aria-<name> (max 15 chars for interface name)
-	iface := fmt.Sprintf("wga-%s", sanitize(name))
-	if len(iface) > 15 {
-		iface = iface[:15]
-	}
-	return iface
-}
-
-// needsSudo returns true if the current process is not running as root.
-func needsSudo() bool {
-	return os.Geteuid() != 0
-}
-
-// sudoCmd wraps a command with sudo if not already root.
-func sudoCmd(ctx context.Context, name string, args ...string) *exec.Cmd {
-	if needsSudo() {
-		return exec.CommandContext(ctx, "sudo", append([]string{"-n", name}, args...)...)
-	}
-	return exec.CommandContext(ctx, name, args...)
-}
-
-// sudoCmdNoCtx wraps a command with sudo if not already root (no context).
-func sudoCmdNoCtx(name string, args ...string) *exec.Cmd {
-	if needsSudo() {
-		return exec.Command("sudo", append([]string{"-n", name}, args...)...)
-	}
-	return exec.Command(name, args...)
-}
-
-func sanitize(s string) string {
-	result := strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
-			return r
-		}
-		if r >= 'A' && r <= 'Z' {
-			return r + 32 // lowercase
-		}
-		return '-'
-	}, s)
-	return strings.Trim(result, "-")
-}
-
-// startWireGuardGo launches wireguard-go for the given interface name.
-// On macOS, wireguard-go auto-assigns a utun interface.
-func startWireGuardGo(ctx context.Context, ifaceName string) (*exec.Cmd, string, error) {
-	// Ensure the UAPI socket directory exists — wireguard-go won't create it
-	if err := os.MkdirAll("/var/run/wireguard", 0755); err != nil {
-		// Try with sudo
-		if out, sudoErr := sudoCmdNoCtx("mkdir", "-p", "/var/run/wireguard").CombinedOutput(); sudoErr != nil {
-			return nil, "", fmt.Errorf("creating /var/run/wireguard: %w (sudo: %s)", err, strings.TrimSpace(string(out)))
-		}
-	}
-
-	// Write output to a temp log file so we can read it while the process runs
-	// (avoids concurrency issues with pipes + Wait)
-	logFile, err := os.CreateTemp("", "wireguard-go-*.log")
-	if err != nil {
-		return nil, "", fmt.Errorf("creating log file: %w", err)
-	}
-	logPath := logFile.Name()
-
-	cmd := sudoCmd(ctx, "wireguard-go", ifaceName)
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-
-	// WG_TUN_NAME_FILE: wireguard-go writes the actual interface name here
-	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("wg-tun-%s-%d", ifaceName, time.Now().UnixNano()))
-	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("WG_TUN_NAME_FILE=%s", tmpFile),
-		"WG_PROCESS_FOREGROUND=1",
-		"LOG_LEVEL=debug",
-	)
-
-	if err := cmd.Start(); err != nil {
-		logFile.Close()
-		os.Remove(logPath)
-		return nil, "", fmt.Errorf("failed to start wireguard-go: %w", err)
-	}
-
-	readLog := func() string {
-		data, _ := os.ReadFile(logPath)
-		s := strings.TrimSpace(string(data))
-		if s == "" {
-			return "no output"
-		}
-		return s
-	}
-
-	processExited := func() bool {
-		// Signal 0 checks if process is still alive without sending a signal
-		if cmd.Process == nil {
-			return true
-		}
-		err := cmd.Process.Signal(syscall.Signal(0))
-		return err != nil
-	}
-
-	actualIface := ifaceName
-
-	// Wait for wireguard-go to create the interface (up to 10 seconds)
-	for i := 0; i < 100; i++ {
-		time.Sleep(100 * time.Millisecond)
-
-		// Check if wireguard-go died early
-		if processExited() {
-			cmd.Wait() // reap the process
-			logFile.Close()
-			output := readLog()
-			os.Remove(logPath)
-			os.Remove(tmpFile)
-			return nil, "", fmt.Errorf("wireguard-go exited early\nOutput: %s\n\nHint: wireguard-go needs root. Try: sudo ./aria-tui", output)
-		}
-
-		// Parse output for interface name like "INFO: (utun3) ..."
-		for _, line := range strings.Split(readLog(), "\n") {
-			if idx := strings.Index(line, "("); idx >= 0 {
-				if end := strings.Index(line[idx:], ")"); end >= 0 {
-					parsed := line[idx+1 : idx+end]
-					if parsed != "" {
-						actualIface = parsed
-					}
-				}
-			}
-		}
-
-		// Check WG_TUN_NAME_FILE (most reliable for macOS)
-		if data, readErr := os.ReadFile(tmpFile); readErr == nil {
-			actual := strings.TrimSpace(string(data))
-			if actual != "" {
-				actualIface = actual
-			}
-		}
-
-		// Check if the UAPI socket exists (means wireguard-go is ready)
-		socketPath := fmt.Sprintf("/var/run/wireguard/%s.sock", actualIface)
-		if _, statErr := os.Stat(socketPath); statErr == nil {
-			os.Remove(tmpFile)
-			os.Remove(logPath)
-			logFile.Close()
-			return cmd, actualIface, nil
-		}
-	}
-
-	os.Remove(tmpFile)
-
-	// Socket never appeared — collect diagnostics
-	output := readLog()
-	logFile.Close()
-	os.Remove(logPath)
-
-	// List what's actually in /var/run/wireguard for debugging
-	var sockDir string
-	if entries, dirErr := os.ReadDir("/var/run/wireguard"); dirErr == nil {
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
-			names = append(names, e.Name())
-		}
-		if len(names) > 0 {
-			sockDir = fmt.Sprintf(" (dir contains: %s)", strings.Join(names, ", "))
-		} else {
-			sockDir = " (dir is empty)"
-		}
-	} else {
-		sockDir = fmt.Sprintf(" (dir error: %v)", dirErr)
-	}
-
-	if needsSudo() {
-		sudoCmdNoCtx("kill", fmt.Sprintf("%d", cmd.Process.Pid)).Run()
-	} else {
-		cmd.Process.Kill()
-	}
-	cmd.Wait()
-
-	return nil, "", fmt.Errorf("wireguard-go started but UAPI socket never appeared\nExpected: /var/run/wireguard/%s.sock%s\nInterface: %s\nOutput: %s\n\nHint: ensure your user has passwordless sudo for wireguard-go, wg, ifconfig/ip", actualIface, sockDir, actualIface, output)
-}
-
-// configureInterface sets up the WireGuard interface with wg and assigns IP.
-func configureInterface(ctx context.Context, iface string, confFile string, address string) error {
-	// Apply WireGuard configuration, retrying since wireguard-go may still be initializing
-	var lastErr error
-	for attempt := 0; attempt < 10; attempt++ {
-		cmd := sudoCmd(ctx, "wg", "setconf", iface, confFile)
-		out, err := cmd.CombinedOutput()
-		if err == nil {
-			lastErr = nil
-			break
-		}
-		lastErr = fmt.Errorf("wg setconf: %s: %w", strings.TrimSpace(string(out)), err)
-		time.Sleep(500 * time.Millisecond)
-	}
-	if lastErr != nil {
-		return lastErr
-	}
-
-	// Parse address for IP assignment
-	ip, ipNet, err := net.ParseCIDR(address)
-	if err != nil {
-		// Try without CIDR
-		ip = net.ParseIP(address)
-		if ip == nil {
-			return fmt.Errorf("invalid address: %s", address)
-		}
-		ipNet = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
-	}
-
-	// Assign IP address to interface
-	switch runtime.GOOS {
-	case "darwin":
-		// macOS: ifconfig utunX inet <ip> <ip> (point-to-point)
-		ifCmd := sudoCmd(ctx, "ifconfig", iface, "inet", ip.String(), ip.String())
-		if out, err := ifCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("ifconfig: %s: %w", strings.TrimSpace(string(out)), err)
-		}
-
-		// Set MTU
-		mtuCmd := sudoCmd(ctx, "ifconfig", iface, "mtu", "1420")
-		mtuCmd.Run() // best effort
-
-	case "linux":
-		// Linux: ip addr add <cidr> dev <iface>
-		ones, _ := ipNet.Mask.Size()
-		cidr := fmt.Sprintf("%s/%d", ip.String(), ones)
-		addrCmd := sudoCmd(ctx, "ip", "addr", "add", cidr, "dev", iface)
-		if out, err := addrCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("ip addr add: %s: %w", strings.TrimSpace(string(out)), err)
-		}
-
-		// Bring interface up
-		upCmd := sudoCmd(ctx, "ip", "link", "set", iface, "up")
-		if out, err := upCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("ip link set up: %s: %w", strings.TrimSpace(string(out)), err)
-		}
-
-		// Set MTU
-		mtuCmd := sudoCmd(ctx, "ip", "link", "set", iface, "mtu", "1420")
-		mtuCmd.Run() // best effort
-	}
-
-	return nil
-}
-
-// setupRouting configures policy routing so traffic bound to the WireGuard interface
-// actually routes through it. On Linux, this uses fwmark + ip rule + ip route.
-//
-// The approach mirrors `wg-quick`:
-// 1. Mark WireGuard's own UDP packets with fwmark so they use the main table
-// 2. Add an ip rule so all other traffic uses our custom routing table
-// 3. Add routes in the custom table through the WireGuard interface
-//
-// Combined with aria2c's --interface (SO_BINDTODEVICE), this ensures downloads
-// go through the VPN tunnel while WireGuard's encrypted packets reach the endpoint.
-func setupRouting(ctx context.Context, iface string, localIP string, allowedIPs []string, tableID, fwmark int) error {
-	switch runtime.GOOS {
-	case "darwin":
-		return setupRoutingDarwin(ctx, iface, localIP, allowedIPs)
-	case "linux":
-		return setupRoutingLinux(ctx, iface, localIP, allowedIPs, tableID, fwmark)
-	}
-	return nil
-}
-
-// setupRoutingDarwin adds interface-scoped routes on macOS.
-// IP_BOUND_IF sets the source IP but macOS still needs routes to know HOW to
-// reach destinations through utun interfaces. Using -ifscope makes the routes
-// only apply to sockets bound to that specific interface, so multiple tunnels
-// don't conflict with each other or the default route.
-func setupRoutingDarwin(ctx context.Context, iface string, localIP string, allowedIPs []string) error {
-	for _, cidr := range allowedIPs {
-		if cidr == "0.0.0.0/0" {
-			// Split-default with -ifscope: only applies to sockets bound to this interface
-			for _, half := range []string{"0.0.0.0/1", "128.0.0.0/1"} {
-				routeCmd := sudoCmd(ctx, "route", "add", "-ifscope", iface, "-net", half, "-interface", iface)
-				if out, err := routeCmd.CombinedOutput(); err != nil {
-					return fmt.Errorf("route add -ifscope %s %s: %s: %w", iface, half, strings.TrimSpace(string(out)), err)
-				}
-			}
-		} else if cidr == "::/0" {
-			// Skip IPv6 for now
-			continue
-		} else {
-			routeCmd := sudoCmd(ctx, "route", "add", "-ifscope", iface, "-net", cidr, "-interface", iface)
-			if out, err := routeCmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("route add -ifscope %s %s: %s: %w", iface, cidr, strings.TrimSpace(string(out)), err)
-			}
-		}
-	}
-	return nil
-}
-
-// setupRoutingLinux uses fwmark + ip rule + ip route for policy routing.
-func setupRoutingLinux(ctx context.Context, iface string, localIP string, allowedIPs []string, tableID, fwmark int) error {
-	tStr := fmt.Sprintf("%d", tableID)
-	fStr := fmt.Sprintf("%d", fwmark)
-
-	// Mark WireGuard's own encrypted UDP packets so they bypass the custom table
-	wgCmd := sudoCmd(ctx, "wg", "set", iface, "fwmark", fStr)
-	if out, err := wgCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("wg set fwmark: %s: %w", strings.TrimSpace(string(out)), err)
-	}
-
-	// Add routes in custom table for AllowedIPs through the WireGuard interface
-	for _, cidr := range allowedIPs {
-		if cidr == "0.0.0.0/0" {
-			routeCmd := sudoCmd(ctx, "ip", "route", "add", "default", "dev", iface, "table", tStr)
-			if out, err := routeCmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("ip route add default: %s: %w", strings.TrimSpace(string(out)), err)
-			}
-		} else {
-			routeCmd := sudoCmd(ctx, "ip", "route", "add", cidr, "dev", iface, "table", tStr)
-			if out, err := routeCmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("ip route add %s: %s: %w", cidr, strings.TrimSpace(string(out)), err)
-			}
-		}
-	}
-
-	// Rule: traffic from the WireGuard interface's IP uses our custom table
-	if localIP != "" {
-		ruleCmd := sudoCmd(ctx, "ip", "rule", "add", "from", localIP, "not", "fwmark", fStr, "table", tStr)
-		if out, err := ruleCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("ip rule add: %s: %w", strings.TrimSpace(string(out)), err)
-		}
-	}
-
-	return nil
-}
-
-// cleanupRouting removes routing rules for a tunnel.
-func cleanupRouting(iface string, tableID, fwmark int) {
-	switch runtime.GOOS {
-	case "darwin":
-		// Remove scoped split-default routes (best effort)
-		sudoCmdNoCtx("route", "delete", "-ifscope", iface, "-net", "0.0.0.0/1", "-interface", iface).Run()
-		sudoCmdNoCtx("route", "delete", "-ifscope", iface, "-net", "128.0.0.0/1", "-interface", iface).Run()
-	case "linux":
-		tStr := fmt.Sprintf("%d", tableID)
-		sudoCmdNoCtx("ip", "rule", "del", "table", tStr).Run()
-		sudoCmdNoCtx("ip", "route", "flush", "table", tStr).Run()
-	}
-}
-
 // startAria2c launches an aria2c process that routes through an HTTP CONNECT proxy.
-// The proxy handles interface binding via IP_BOUND_IF/SO_BINDTODEVICE.
 func startAria2c(ctx context.Context, proxyPort int, rpcPort int, downloadDir string) (*exec.Cmd, string, error) {
 	args := []string{
 		"--enable-rpc=true",
@@ -706,7 +251,7 @@ func startAria2c(ctx context.Context, proxyPort int, rpcPort int, downloadDir st
 	time.Sleep(1 * time.Second)
 
 	if cmd.Process != nil {
-		if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+		if err := cmd.Process.Signal(os.Signal(nil)); err != nil {
 			// Process already exited
 			cmd.Wait()
 			logData, _ := os.ReadFile(logPath)
@@ -741,105 +286,4 @@ func fileAllocMethod() string {
 	return "falloc"
 }
 
-// removeInterface removes a network interface.
-func removeInterface(iface string) {
-	switch runtime.GOOS {
-	case "darwin":
-		// On macOS, killing wireguard-go removes the utun
-		// But we can also try to bring it down
-		sudoCmdNoCtx("ifconfig", iface, "down").Run()
-	case "linux":
-		sudoCmdNoCtx("ip", "link", "delete", iface).Run()
-	}
-}
 
-// parseAddress extracts the Address field from a WireGuard config.
-func parseAddress(config string) string {
-	for _, line := range strings.Split(config, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(strings.ToLower(line), "address") {
-			parts := strings.SplitN(line, "=", 2)
-			if len(parts) == 2 {
-				addr := strings.TrimSpace(parts[1])
-				// Handle comma-separated addresses (take first IPv4)
-				for _, a := range strings.Split(addr, ",") {
-					a = strings.TrimSpace(a)
-					if strings.Contains(a, ".") { // IPv4
-						return a
-					}
-				}
-				return addr
-			}
-		}
-	}
-	return ""
-}
-
-// parseAllowedIPs extracts AllowedIPs from [Peer] sections of a WireGuard config.
-func parseAllowedIPs(config string) []string {
-	var result []string
-	for _, line := range strings.Split(config, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(strings.ToLower(line), "allowedips") {
-			parts := strings.SplitN(line, "=", 2)
-			if len(parts) == 2 {
-				for _, cidr := range strings.Split(parts[1], ",") {
-					cidr = strings.TrimSpace(cidr)
-					if cidr != "" && strings.Contains(cidr, ".") { // IPv4 only
-						result = append(result, cidr)
-					}
-				}
-			}
-		}
-	}
-	return result
-}
-
-// stripInterfaceExtras removes lines that wg setconf doesn't understand
-// (Address, DNS, MTU, etc. from [Interface] section).
-func stripInterfaceExtras(config string) string {
-	var result strings.Builder
-	inInterface := false
-
-	for _, line := range strings.Split(config, "\n") {
-		trimmed := strings.TrimSpace(line)
-		lower := strings.ToLower(trimmed)
-
-		if trimmed == "[Interface]" {
-			inInterface = true
-			result.WriteString(line + "\n")
-			continue
-		}
-		if strings.HasPrefix(trimmed, "[") {
-			inInterface = false
-		}
-
-		if inInterface {
-			// Skip lines that wg setconf doesn't understand
-			if strings.HasPrefix(lower, "address") ||
-				strings.HasPrefix(lower, "dns") ||
-				strings.HasPrefix(lower, "mtu") ||
-				strings.HasPrefix(lower, "preup") ||
-				strings.HasPrefix(lower, "postup") ||
-				strings.HasPrefix(lower, "predown") ||
-				strings.HasPrefix(lower, "postdown") ||
-				strings.HasPrefix(lower, "table") ||
-				strings.HasPrefix(lower, "saveconfig") {
-				continue
-			}
-		}
-
-		result.WriteString(line + "\n")
-	}
-	return result.String()
-}
-
-// writeTempConfig writes a WireGuard config to a temp file.
-func writeTempConfig(name string, content string) (string, error) {
-	dir := os.TempDir()
-	path := filepath.Join(dir, fmt.Sprintf("aria-tui-wg-%s-%d.conf", sanitize(name), time.Now().UnixNano()))
-	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
-		return "", err
-	}
-	return path, nil
-}

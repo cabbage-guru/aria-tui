@@ -7,9 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -153,7 +151,7 @@ func handleTest() {
 	if tun1.Proxy != nil {
 		proxyPort1 = tun1.Proxy.Port()
 	}
-	fmt.Printf("OK (iface=%s, rpc=%d, proxy=%d)\n", tun1.Interface, tun1.RPCPort, proxyPort1)
+	fmt.Printf("OK (rpc=%d, proxy=%d)\n", tun1.RPCPort, proxyPort1)
 
 	// Switch download dir for tunnel 2 so IP check file doesn't collide
 	tunnelMgr.SetDownloadDir(tmpDir2)
@@ -168,7 +166,7 @@ func handleTest() {
 	if tun2.Proxy != nil {
 		proxyPort2 = tun2.Proxy.Port()
 	}
-	fmt.Printf("OK (iface=%s, rpc=%d, proxy=%d)\n", tun2.Interface, tun2.RPCPort, proxyPort2)
+	fmt.Printf("OK (rpc=%d, proxy=%d)\n", tun2.RPCPort, proxyPort2)
 
 	// Step 5: Wait for both RPCs
 	fmt.Print("[5/7] Waiting for aria2c RPC (tunnel 1)... ")
@@ -211,18 +209,7 @@ func handleTest() {
 		fmt.Printf("%s\n", directIP2)
 	}
 
-	// Test 2: Global routes test (wg-quick approach) on tunnel 1 only
-	// This tests whether the tunnel can carry traffic at all
-	fmt.Print("[8/12] Testing tunnel 1 with global routes (wg-quick style)... ")
-	globalRouteIP := testGlobalRoutes(tun1.Interface, ipCheckURL)
-	fmt.Printf("%s\n", globalRouteIP)
-
-	// Test 3: curl --interface test
-	fmt.Print("[9/12] Testing curl --interface utun10... ")
-	curlIP := testCurlInterface(tun1.Interface, ipCheckURL)
-	fmt.Printf("%s\n", curlIP)
-
-	fmt.Print("[10/12] Checking external IP via aria2c (tunnel 1)... ")
+	fmt.Print("[8/10] Checking external IP via aria2c (tunnel 1)... ")
 	ip1, err := getExternalIP(client1, ipCheckURL, tmpDir1)
 	if err != nil {
 		fmt.Printf("FAIL\n  %v\n", err)
@@ -268,20 +255,15 @@ func handleTest() {
 	fmt.Println("--- Proxy diagnostics ---")
 	if tun1.Proxy != nil {
 		total, ok, fail := tun1.Proxy.Stats()
-		fmt.Printf("  Proxy 1 (%s:%d): conns=%d dial_ok=%d dial_fail=%d\n", tun1.Interface, tun1.Proxy.Port(), total, ok, fail)
+		fmt.Printf("  Proxy 1 (port %d): conns=%d dial_ok=%d dial_fail=%d\n", tun1.Proxy.Port(), total, ok, fail)
 	}
 	if tun2.Proxy != nil {
 		total, ok, fail := tun2.Proxy.Stats()
-		fmt.Printf("  Proxy 2 (%s:%d): conns=%d dial_ok=%d dial_fail=%d\n", tun2.Interface, tun2.Proxy.Port(), total, ok, fail)
+		fmt.Printf("  Proxy 2 (port %d): conns=%d dial_ok=%d dial_fail=%d\n", tun2.Proxy.Port(), total, ok, fail)
 	}
 
-	// Print routing diagnostics
-	fmt.Println()
-	fmt.Println("--- Routing diagnostics ---")
-	printDiagnostics(tun1.Interface, tun2.Interface)
-
 	// Step 8: Download test file through both tunnels
-	fmt.Printf("\n[11/12] Downloading test file through tunnel 1... ")
+	fmt.Printf("\n[9/10] Downloading test file through tunnel 1... ")
 	if err := testDownload(client1, testURL); err != nil {
 		fmt.Printf("FAIL\n  %v\n", err)
 		os.Exit(1)
@@ -300,18 +282,18 @@ func handleTest() {
 	fmt.Println("--- Proxy stats after downloads ---")
 	if tun1.Proxy != nil {
 		total, ok, fail := tun1.Proxy.Stats()
-		fmt.Printf("  Proxy 1 (%s:%d): conns=%d dial_ok=%d dial_fail=%d\n", tun1.Interface, tun1.Proxy.Port(), total, ok, fail)
+		fmt.Printf("  Proxy 1 (port %d): conns=%d dial_ok=%d dial_fail=%d\n", tun1.Proxy.Port(), total, ok, fail)
 	}
 	if tun2.Proxy != nil {
 		total, ok, fail := tun2.Proxy.Stats()
-		fmt.Printf("  Proxy 2 (%s:%d): conns=%d dial_ok=%d dial_fail=%d\n", tun2.Interface, tun2.Proxy.Port(), total, ok, fail)
+		fmt.Printf("  Proxy 2 (port %d): conns=%d dial_ok=%d dial_fail=%d\n", tun2.Proxy.Port(), total, ok, fail)
 	}
 
 	fmt.Println()
 	fmt.Println("=== Test passed! ===")
 	fmt.Printf("  Host:     %s\n", hostIP)
-	fmt.Printf("  Tunnel 1: %s (iface=%s, vpn=%s)\n", ip1, tun1.Interface, wgCfg1.Name)
-	fmt.Printf("  Tunnel 2: %s (iface=%s, vpn=%s)\n", ip2, tun2.Interface, wgCfg2.Name)
+	fmt.Printf("  Tunnel 1: %s (vpn=%s)\n", ip1, wgCfg1.Name)
+	fmt.Printf("  Tunnel 2: %s (vpn=%s)\n", ip2, wgCfg2.Name)
 	if ip1 != ip2 {
 		fmt.Println("  IPs differ: traffic is correctly routed through separate VPNs")
 	}
@@ -337,77 +319,6 @@ func getIPViaProxy(proxyPort int, checkURL string) (string, error) {
 	return strings.TrimSpace(string(body)), nil
 }
 
-// testGlobalRoutes temporarily adds non-scoped global routes (wg-quick approach)
-// for a single tunnel to verify the WireGuard tunnel can carry traffic at all.
-func testGlobalRoutes(iface string, checkURL string) string {
-	// Get current default gateway
-	out, err := exec.Command("route", "-n", "get", "default").CombinedOutput()
-	if err != nil {
-		return fmt.Sprintf("FAIL (route get default: %v)", err)
-	}
-	var defaultGW string
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "gateway:") {
-			defaultGW = strings.TrimSpace(strings.TrimPrefix(line, "gateway:"))
-		}
-	}
-	if defaultGW == "" {
-		return fmt.Sprintf("FAIL (no default gateway found)\n  route get output:\n%s", string(out))
-	}
-
-	// Get WireGuard endpoint for this interface
-	wgOut, err := exec.Command("sudo", "wg", "show", iface, "endpoints").CombinedOutput()
-	if err != nil {
-		return fmt.Sprintf("FAIL (wg show endpoints: %v)", err)
-	}
-	var endpointIP string
-	for _, line := range strings.Split(string(wgOut), "\n") {
-		parts := strings.Fields(line)
-		if len(parts) >= 2 {
-			ep := parts[1]
-			if idx := strings.LastIndex(ep, ":"); idx > 0 {
-				endpointIP = ep[:idx]
-			}
-		}
-	}
-
-	// Add endpoint exclusion route (so WG encrypted packets still reach the endpoint)
-	if endpointIP != "" {
-		exec.Command("sudo", "route", "add", "-host", endpointIP, defaultGW).Run()
-		defer exec.Command("sudo", "route", "delete", "-host", endpointIP).Run()
-	}
-
-	// Add global split-default routes
-	exec.Command("sudo", "route", "add", "-net", "0.0.0.0/1", "-interface", iface).Run()
-	exec.Command("sudo", "route", "add", "-net", "128.0.0.0/1", "-interface", iface).Run()
-	defer exec.Command("sudo", "route", "delete", "-net", "0.0.0.0/1", "-interface", iface).Run()
-	defer exec.Command("sudo", "route", "delete", "-net", "128.0.0.0/1", "-interface", iface).Run()
-
-	// Now try to get external IP - ALL traffic should go through the tunnel
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(checkURL)
-	if err != nil {
-		return fmt.Sprintf("FAIL (http get: %v) [gw=%s, ep=%s]", err, defaultGW, endpointIP)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	ip := strings.TrimSpace(string(body))
-
-	// Also show WG transfer after test
-	wgOut2, _ := exec.Command("sudo", "wg", "show", iface, "transfer").CombinedOutput()
-	return fmt.Sprintf("%s [gw=%s, ep=%s, wg_transfer=%s]", ip, defaultGW, endpointIP, strings.TrimSpace(string(wgOut2)))
-}
-
-// testCurlInterface uses curl --interface to test interface binding.
-func testCurlInterface(iface string, checkURL string) string {
-	out, err := exec.Command("curl", "-s", "--max-time", "10", "--interface", iface, checkURL).CombinedOutput()
-	if err != nil {
-		return fmt.Sprintf("FAIL (%v: %s)", err, strings.TrimSpace(string(out)))
-	}
-	return strings.TrimSpace(string(out))
-}
-
 // getHostExternalIP fetches the host's external IP directly (no tunnel).
 func getHostExternalIP(checkURL string) (string, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -423,87 +334,6 @@ func getHostExternalIP(checkURL string) (string, error) {
 	return strings.TrimSpace(string(body)), nil
 }
 
-// printDiagnostics dumps routing and WireGuard state for debugging.
-func printDiagnostics(ifaces ...string) {
-	// Show default route
-	fmt.Println("  route -n get default:")
-	if out, err := exec.Command("route", "-n", "get", "default").CombinedOutput(); err == nil {
-		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			fmt.Printf("    %s\n", line)
-		}
-	}
-
-	// Show WireGuard status
-	fmt.Println("  wg show:")
-	if out, err := exec.Command("sudo", "wg", "show").CombinedOutput(); err == nil {
-		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			fmt.Printf("    %s\n", line)
-		}
-	} else {
-		fmt.Printf("    (error: %v)\n", err)
-	}
-
-	// Show ip rules
-	fmt.Println("  ip rule list:")
-	if out, err := exec.Command("ip", "rule", "list").CombinedOutput(); err == nil {
-		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			fmt.Printf("    %s\n", line)
-		}
-	}
-
-	// Show routing tables for our tunnels (51820+)
-	for i, iface := range ifaces {
-		tableID := 51820 + i
-		fmt.Printf("  ip route show table %d (iface %s):\n", tableID, iface)
-		if out, err := exec.Command("ip", "route", "show", "table", fmt.Sprintf("%d", tableID)).CombinedOutput(); err == nil {
-			output := strings.TrimSpace(string(out))
-			if output == "" {
-				fmt.Println("    (empty)")
-			} else {
-				for _, line := range strings.Split(output, "\n") {
-					fmt.Printf("    %s\n", line)
-				}
-			}
-		}
-	}
-
-	// Show interface addresses (use ifconfig on macOS, ip on Linux)
-	for _, iface := range ifaces {
-		if runtime.GOOS == "darwin" {
-			fmt.Printf("  ifconfig %s:\n", iface)
-			if out, err := exec.Command("ifconfig", iface).CombinedOutput(); err == nil {
-				for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-					fmt.Printf("    %s\n", line)
-				}
-			} else {
-				fmt.Printf("    (error: %v)\n", err)
-			}
-		} else {
-			fmt.Printf("  ip addr show %s:\n", iface)
-			if out, err := exec.Command("ip", "addr", "show", iface).CombinedOutput(); err == nil {
-				for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-					fmt.Printf("    %s\n", line)
-				}
-			} else {
-				fmt.Printf("    (error: %v)\n", err)
-			}
-		}
-	}
-
-	// On macOS, show route table for debugging
-	if runtime.GOOS == "darwin" {
-		fmt.Println("  netstat -rn (relevant routes):")
-		if out, err := exec.Command("netstat", "-rn").CombinedOutput(); err == nil {
-			for _, line := range strings.Split(string(out), "\n") {
-				for _, iface := range ifaces {
-					if strings.Contains(line, iface) {
-						fmt.Printf("    %s\n", line)
-					}
-				}
-			}
-		}
-	}
-}
 
 // waitForRPC polls aria2c RPC until ready, returns false on failure.
 func waitForRPC(client *download.Aria2Client, tun *tunnel.Tunnel) bool {
