@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
@@ -30,14 +31,12 @@ type Tunnel struct {
 type Manager struct {
 	mu          sync.Mutex
 	tunnels     map[string]*Tunnel
-	nextPort    int
 	downloadDir string
 }
 
 func NewManager(downloadDir string) *Manager {
 	return &Manager{
 		tunnels:     make(map[string]*Tunnel),
-		nextPort:    6800,
 		downloadDir: downloadDir,
 	}
 }
@@ -68,10 +67,11 @@ func CheckDependencies() error {
 // routed through it via an HTTP CONNECT proxy.
 // No kernel interfaces, no routing tables, no sudo needed for WireGuard.
 func (m *Manager) StartTunnel(ctx context.Context, name string, wgConfigContents string) (*Tunnel, error) {
-	m.mu.Lock()
-	port := m.nextPort
-	m.nextPort++
-	m.mu.Unlock()
+	// Find a free port for aria2c RPC
+	port, err := freePort()
+	if err != nil {
+		return nil, fmt.Errorf("finding free port: %w", err)
+	}
 
 	tunnelCtx, cancel := context.WithCancel(ctx)
 
@@ -201,6 +201,17 @@ func (m *Manager) IsRunning(name string) bool {
 		return err == nil
 	}
 	return false
+}
+
+// freePort finds an available TCP port by binding to :0 and releasing it.
+func freePort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	return port, nil
 }
 
 // startAria2c launches an aria2c process that routes through an HTTP CONNECT proxy.
