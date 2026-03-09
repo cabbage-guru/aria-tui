@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -23,7 +24,7 @@ type Tunnel struct {
 	Aria2Cmd   *exec.Cmd
 	Aria2Log   string // path to aria2c log file for debugging
 	WGCmd      *exec.Cmd // wireguard-go process
-	SocksProxy *SocksProxy // SOCKS5 proxy that routes through this tunnel
+	Proxy *ConnectProxy // HTTP CONNECT proxy that routes through this tunnel
 	Created    time.Time
 	cancel     context.CancelFunc
 	routeTable int    // Linux routing table ID for policy routing
@@ -170,21 +171,21 @@ func (m *Manager) StartTunnel(ctx context.Context, name string, wgConfigContents
 		}
 	}
 
-	// Start a SOCKS5 proxy that forces connections through the WireGuard interface
-	// using IP_BOUND_IF (macOS) or SO_BINDTODEVICE (Linux). This is more reliable
-	// than aria2c's --interface which only uses bind().
-	socksProxy, err := StartSocksProxy(tunnelCtx, actualIface)
+	// Start an HTTP CONNECT proxy that forces connections through the WireGuard
+	// interface using IP_BOUND_IF (macOS) or SO_BINDTODEVICE (Linux).
+	proxyLogger := log.New(os.Stderr, "", log.LstdFlags)
+	proxy, err := StartConnectProxy(tunnelCtx, actualIface, proxyLogger)
 	if err != nil {
 		cleanupRouting(actualIface, tableID, fwmark)
 		killWg()
 		cancel()
 		removeInterface(actualIface)
-		return nil, fmt.Errorf("starting SOCKS proxy: %w", err)
+		return nil, fmt.Errorf("starting proxy: %w", err)
 	}
 
-	aria2Cmd, aria2LogPath, err := startAria2c(tunnelCtx, socksProxy.Port(), port, m.downloadDir)
+	aria2Cmd, aria2LogPath, err := startAria2c(tunnelCtx, proxy.Port(), port, m.downloadDir)
 	if err != nil {
-		socksProxy.Stop()
+		proxy.Stop()
 		cleanupRouting(actualIface, tableID, fwmark)
 		killWg()
 		cancel()
@@ -200,7 +201,7 @@ func (m *Manager) StartTunnel(ctx context.Context, name string, wgConfigContents
 		Aria2Cmd:   aria2Cmd,
 		Aria2Log:   aria2LogPath,
 		WGCmd:      wgCmd,
-		SocksProxy: socksProxy,
+		Proxy:      proxy,
 		Created:    time.Now(),
 		cancel:     cancel,
 		routeTable: tableID,
@@ -240,9 +241,9 @@ func stopTunnel(t *Tunnel) error {
 		t.Aria2Cmd.Wait()
 	}
 
-	// Stop SOCKS proxy
-	if t.SocksProxy != nil {
-		t.SocksProxy.Stop()
+	// Stop proxy
+	if t.Proxy != nil {
+		t.Proxy.Stop()
 	}
 
 	// Kill wireguard-go (may be running as root via sudo)
@@ -635,10 +636,9 @@ func cleanupRouting(iface string, tableID, fwmark int) {
 	}
 }
 
-// startAria2c launches an aria2c process that routes through a SOCKS proxy.
-// The SOCKS proxy handles interface binding via IP_BOUND_IF/SO_BINDTODEVICE,
-// which is more reliable than aria2c's --interface (which only uses bind()).
-func startAria2c(ctx context.Context, socksPort int, rpcPort int, downloadDir string) (*exec.Cmd, string, error) {
+// startAria2c launches an aria2c process that routes through an HTTP CONNECT proxy.
+// The proxy handles interface binding via IP_BOUND_IF/SO_BINDTODEVICE.
+func startAria2c(ctx context.Context, proxyPort int, rpcPort int, downloadDir string) (*exec.Cmd, string, error) {
 	args := []string{
 		"--enable-rpc=true",
 		"--rpc-listen-all=false",
@@ -647,7 +647,7 @@ func startAria2c(ctx context.Context, socksPort int, rpcPort int, downloadDir st
 		"--disable-ipv6=true",
 		fmt.Sprintf("--rpc-secret=%s", rpcSecret(rpcPort)),
 		fmt.Sprintf("--dir=%s", downloadDir),
-		fmt.Sprintf("--all-proxy=socks5://127.0.0.1:%d", socksPort),
+		fmt.Sprintf("--all-proxy=http://127.0.0.1:%d", proxyPort),
 		fmt.Sprintf("--file-allocation=%s", fileAllocMethod()),
 		"--continue=true",
 		"--max-connection-per-server=4",

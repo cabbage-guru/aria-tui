@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -147,11 +149,11 @@ func handleTest() {
 		fmt.Printf("FAIL\n  %v\n", err)
 		os.Exit(1)
 	}
-	socksPort1 := 0
-	if tun1.SocksProxy != nil {
-		socksPort1 = tun1.SocksProxy.Port()
+	proxyPort1 := 0
+	if tun1.Proxy != nil {
+		proxyPort1 = tun1.Proxy.Port()
 	}
-	fmt.Printf("OK (iface=%s, rpc=%d, socks=%d)\n", tun1.Interface, tun1.RPCPort, socksPort1)
+	fmt.Printf("OK (iface=%s, rpc=%d, proxy=%d)\n", tun1.Interface, tun1.RPCPort, proxyPort1)
 
 	// Switch download dir for tunnel 2 so IP check file doesn't collide
 	tunnelMgr.SetDownloadDir(tmpDir2)
@@ -162,11 +164,11 @@ func handleTest() {
 		fmt.Printf("FAIL\n  %v\n", err)
 		os.Exit(1)
 	}
-	socksPort2 := 0
-	if tun2.SocksProxy != nil {
-		socksPort2 = tun2.SocksProxy.Port()
+	proxyPort2 := 0
+	if tun2.Proxy != nil {
+		proxyPort2 = tun2.Proxy.Port()
 	}
-	fmt.Printf("OK (iface=%s, rpc=%d, socks=%d)\n", tun2.Interface, tun2.RPCPort, socksPort2)
+	fmt.Printf("OK (iface=%s, rpc=%d, proxy=%d)\n", tun2.Interface, tun2.RPCPort, proxyPort2)
 
 	// Step 5: Wait for both RPCs
 	fmt.Print("[5/7] Waiting for aria2c RPC (tunnel 1)... ")
@@ -192,7 +194,24 @@ func handleTest() {
 		fmt.Printf("%s\n", hostIP)
 	}
 
-	fmt.Print("[7/8] Checking external IP (tunnel 1)... ")
+	// Direct proxy test - bypasses aria2c entirely to verify proxy+IP_BOUND_IF works
+	fmt.Print("[7/10] Direct proxy IP check (tunnel 1)... ")
+	directIP1, directErr1 := getIPViaProxy(tun1.Proxy.Port(), ipCheckURL)
+	if directErr1 != nil {
+		fmt.Printf("FAIL: %v\n", directErr1)
+	} else {
+		fmt.Printf("%s\n", directIP1)
+	}
+
+	fmt.Print("       Direct proxy IP check (tunnel 2)... ")
+	directIP2, directErr2 := getIPViaProxy(tun2.Proxy.Port(), ipCheckURL)
+	if directErr2 != nil {
+		fmt.Printf("FAIL: %v\n", directErr2)
+	} else {
+		fmt.Printf("%s\n", directIP2)
+	}
+
+	fmt.Print("[8/10] Checking external IP via aria2c (tunnel 1)... ")
 	ip1, err := getExternalIP(client1, ipCheckURL, tmpDir1)
 	if err != nil {
 		fmt.Printf("FAIL\n  %v\n", err)
@@ -200,7 +219,7 @@ func handleTest() {
 	}
 	fmt.Printf("%s\n", ip1)
 
-	fmt.Print("      Checking external IP (tunnel 2)... ")
+	fmt.Print("       Checking external IP via aria2c (tunnel 2)... ")
 	ip2, err := getExternalIP(client2, ipCheckURL, tmpDir2)
 	if err != nil {
 		fmt.Printf("FAIL\n  %v\n", err)
@@ -233,13 +252,25 @@ func handleTest() {
 		fmt.Println("  Tunnels have different IPs - isolation confirmed!")
 	}
 
+	// Print proxy stats
+	fmt.Println()
+	fmt.Println("--- Proxy diagnostics ---")
+	if tun1.Proxy != nil {
+		total, ok, fail := tun1.Proxy.Stats()
+		fmt.Printf("  Proxy 1 (%s:%d): conns=%d dial_ok=%d dial_fail=%d\n", tun1.Interface, tun1.Proxy.Port(), total, ok, fail)
+	}
+	if tun2.Proxy != nil {
+		total, ok, fail := tun2.Proxy.Stats()
+		fmt.Printf("  Proxy 2 (%s:%d): conns=%d dial_ok=%d dial_fail=%d\n", tun2.Interface, tun2.Proxy.Port(), total, ok, fail)
+	}
+
 	// Print routing diagnostics
 	fmt.Println()
 	fmt.Println("--- Routing diagnostics ---")
 	printDiagnostics(tun1.Interface, tun2.Interface)
 
 	// Step 8: Download test file through both tunnels
-	fmt.Printf("\n[8/8] Downloading test file through tunnel 1... ")
+	fmt.Printf("\n[9/10] Downloading test file through tunnel 1... ")
 	if err := testDownload(client1, testURL); err != nil {
 		fmt.Printf("FAIL\n  %v\n", err)
 		os.Exit(1)
@@ -253,6 +284,18 @@ func handleTest() {
 	}
 	fmt.Println("OK")
 
+	// Post-download proxy stats
+	fmt.Println()
+	fmt.Println("--- Proxy stats after downloads ---")
+	if tun1.Proxy != nil {
+		total, ok, fail := tun1.Proxy.Stats()
+		fmt.Printf("  Proxy 1 (%s:%d): conns=%d dial_ok=%d dial_fail=%d\n", tun1.Interface, tun1.Proxy.Port(), total, ok, fail)
+	}
+	if tun2.Proxy != nil {
+		total, ok, fail := tun2.Proxy.Stats()
+		fmt.Printf("  Proxy 2 (%s:%d): conns=%d dial_ok=%d dial_fail=%d\n", tun2.Interface, tun2.Proxy.Port(), total, ok, fail)
+	}
+
 	fmt.Println()
 	fmt.Println("=== Test passed! ===")
 	fmt.Printf("  Host:     %s\n", hostIP)
@@ -261,6 +304,26 @@ func handleTest() {
 	if ip1 != ip2 {
 		fmt.Println("  IPs differ: traffic is correctly routed through separate VPNs")
 	}
+}
+
+// getIPViaProxy fetches external IP through the HTTP CONNECT proxy directly
+// (bypassing aria2c) to verify the proxy and interface binding work.
+func getIPViaProxy(proxyPort int, checkURL string) (string, error) {
+	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", proxyPort))
+	client := &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
+	}
+	resp, err := client.Get(checkURL)
+	if err != nil {
+		return "", fmt.Errorf("proxy request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(body)), nil
 }
 
 // getHostExternalIP fetches the host's external IP directly (no tunnel).
@@ -314,15 +377,40 @@ func printDiagnostics(ifaces ...string) {
 		}
 	}
 
-	// Show interface addresses
+	// Show interface addresses (use ifconfig on macOS, ip on Linux)
 	for _, iface := range ifaces {
-		fmt.Printf("  ip addr show %s:\n", iface)
-		if out, err := exec.Command("ip", "addr", "show", iface).CombinedOutput(); err == nil {
-			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-				fmt.Printf("    %s\n", line)
+		if runtime.GOOS == "darwin" {
+			fmt.Printf("  ifconfig %s:\n", iface)
+			if out, err := exec.Command("ifconfig", iface).CombinedOutput(); err == nil {
+				for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+					fmt.Printf("    %s\n", line)
+				}
+			} else {
+				fmt.Printf("    (error: %v)\n", err)
 			}
 		} else {
-			fmt.Printf("    (error: %v)\n", err)
+			fmt.Printf("  ip addr show %s:\n", iface)
+			if out, err := exec.Command("ip", "addr", "show", iface).CombinedOutput(); err == nil {
+				for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+					fmt.Printf("    %s\n", line)
+				}
+			} else {
+				fmt.Printf("    (error: %v)\n", err)
+			}
+		}
+	}
+
+	// On macOS, show route table for debugging
+	if runtime.GOOS == "darwin" {
+		fmt.Println("  netstat -rn (relevant routes):")
+		if out, err := exec.Command("netstat", "-rn").CombinedOutput(); err == nil {
+			for _, line := range strings.Split(string(out), "\n") {
+				for _, iface := range ifaces {
+					if strings.Contains(line, iface) {
+						fmt.Printf("    %s\n", line)
+					}
+				}
+			}
 		}
 	}
 }

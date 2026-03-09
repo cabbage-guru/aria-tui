@@ -1,29 +1,37 @@
 package tunnel
 
 import (
+	"bufio"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
+	"sync/atomic"
 )
 
-// SocksProxy is a minimal SOCKS5 proxy that routes all connections through
-// a specific network interface. This is more reliable than aria2c's --interface
-// flag, which only uses bind() (not SO_BINDTODEVICE/IP_BOUND_IF).
-type SocksProxy struct {
-	listener  net.Listener
-	iface     string
-	port      int
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
+// ConnectProxy is an HTTP CONNECT proxy that routes all connections through
+// a specific network interface using OS-level socket binding
+// (IP_BOUND_IF on macOS, SO_BINDTODEVICE on Linux).
+type ConnectProxy struct {
+	listener    net.Listener
+	iface       string
+	port        int
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	connCount   atomic.Int64
+	dialSuccess atomic.Int64
+	dialFail    atomic.Int64
+	logger      *log.Logger
 }
 
-// StartSocksProxy starts a SOCKS5 proxy on a free port that routes all
+// StartConnectProxy starts an HTTP CONNECT proxy on a free port that routes all
 // connections through the given network interface.
-func StartSocksProxy(parentCtx context.Context, iface string) (*SocksProxy, error) {
+func StartConnectProxy(parentCtx context.Context, iface string, logger *log.Logger) (*ConnectProxy, error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, fmt.Errorf("listen: %w", err)
@@ -32,33 +40,47 @@ func StartSocksProxy(parentCtx context.Context, iface string) (*SocksProxy, erro
 	port := listener.Addr().(*net.TCPAddr).Port
 	ctx, cancel := context.WithCancel(parentCtx)
 
-	p := &SocksProxy{
+	if logger == nil {
+		logger = log.Default()
+	}
+
+	p := &ConnectProxy{
 		listener: listener,
 		iface:    iface,
 		port:     port,
 		ctx:      ctx,
 		cancel:   cancel,
+		logger:   logger,
 	}
 
 	p.wg.Add(1)
 	go p.serve()
 
+	logger.Printf("[proxy:%s:%d] started HTTP CONNECT proxy", iface, port)
 	return p, nil
 }
 
 // Port returns the port the proxy is listening on.
-func (p *SocksProxy) Port() int {
+func (p *ConnectProxy) Port() int {
 	return p.port
 }
 
+// Stats returns proxy connection statistics.
+func (p *ConnectProxy) Stats() (total, success, fail int64) {
+	return p.connCount.Load(), p.dialSuccess.Load(), p.dialFail.Load()
+}
+
 // Stop shuts down the proxy.
-func (p *SocksProxy) Stop() {
+func (p *ConnectProxy) Stop() {
 	p.cancel()
 	p.listener.Close()
 	p.wg.Wait()
+	total, success, fail := p.Stats()
+	p.logger.Printf("[proxy:%s:%d] stopped (conns: %d, dial_ok: %d, dial_fail: %d)",
+		p.iface, p.port, total, success, fail)
 }
 
-func (p *SocksProxy) serve() {
+func (p *ConnectProxy) serve() {
 	defer p.wg.Done()
 	for {
 		conn, err := p.listener.Accept()
@@ -74,66 +96,30 @@ func (p *SocksProxy) serve() {
 	}
 }
 
-func (p *SocksProxy) handleConn(clientConn net.Conn) {
+func (p *ConnectProxy) handleConn(clientConn net.Conn) {
 	defer clientConn.Close()
+	p.connCount.Add(1)
 
-	// SOCKS5 handshake: client sends version + auth methods
-	buf := make([]byte, 258)
-	if _, err := io.ReadFull(clientConn, buf[:2]); err != nil {
-		return
-	}
-	if buf[0] != 0x05 { // SOCKS5
-		return
-	}
-	nMethods := int(buf[1])
-	if _, err := io.ReadFull(clientConn, buf[:nMethods]); err != nil {
+	// Read the HTTP request
+	br := bufio.NewReader(clientConn)
+	req, err := http.ReadRequest(br)
+	if err != nil {
+		p.logger.Printf("[proxy:%s] failed to read request: %v", p.iface, err)
 		return
 	}
 
-	// Reply: no auth required
-	clientConn.Write([]byte{0x05, 0x00})
-
-	// Read connect request
-	if _, err := io.ReadFull(clientConn, buf[:4]); err != nil {
-		return
-	}
-	if buf[0] != 0x05 || buf[1] != 0x01 { // CONNECT
-		clientConn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) // command not supported
+	if req.Method != http.MethodConnect {
+		p.logger.Printf("[proxy:%s] non-CONNECT method: %s %s", p.iface, req.Method, req.URL)
+		clientConn.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\n\r\n"))
 		return
 	}
 
-	var destAddr string
-	switch buf[3] {
-	case 0x01: // IPv4
-		if _, err := io.ReadFull(clientConn, buf[:4]); err != nil {
-			return
-		}
-		destAddr = net.IP(buf[:4]).String()
-	case 0x03: // Domain
-		if _, err := io.ReadFull(clientConn, buf[:1]); err != nil {
-			return
-		}
-		domainLen := int(buf[0])
-		if _, err := io.ReadFull(clientConn, buf[:domainLen]); err != nil {
-			return
-		}
-		destAddr = string(buf[:domainLen])
-	case 0x04: // IPv6
-		if _, err := io.ReadFull(clientConn, buf[:16]); err != nil {
-			return
-		}
-		destAddr = net.IP(buf[:16]).String()
-	default:
-		clientConn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
+	target := req.Host
+	if !strings.Contains(target, ":") {
+		target = target + ":443"
 	}
 
-	// Read port
-	if _, err := io.ReadFull(clientConn, buf[:2]); err != nil {
-		return
-	}
-	destPort := binary.BigEndian.Uint16(buf[:2])
-	target := fmt.Sprintf("%s:%d", destAddr, destPort)
+	p.logger.Printf("[proxy:%s] CONNECT %s", p.iface, target)
 
 	// Connect through the bound interface
 	dialer := &net.Dialer{
@@ -142,30 +128,27 @@ func (p *SocksProxy) handleConn(clientConn net.Conn) {
 
 	remoteConn, err := dialer.DialContext(p.ctx, "tcp", target)
 	if err != nil {
-		// Connection refused or network unreachable
-		clientConn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		p.dialFail.Add(1)
+		p.logger.Printf("[proxy:%s] dial %s failed: %v", p.iface, target, err)
+		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 	defer remoteConn.Close()
+	p.dialSuccess.Add(1)
 
-	// Send success reply
-	localAddr := remoteConn.LocalAddr().(*net.TCPAddr)
-	reply := make([]byte, 10)
-	reply[0] = 0x05 // version
-	reply[1] = 0x00 // success
-	reply[2] = 0x00 // reserved
-	reply[3] = 0x01 // IPv4
-	copy(reply[4:8], localAddr.IP.To4())
-	binary.BigEndian.PutUint16(reply[8:10], uint16(localAddr.Port))
-	if _, err := clientConn.Write(reply); err != nil {
-		return
-	}
+	localAddr := remoteConn.LocalAddr()
+	p.logger.Printf("[proxy:%s] connected %s -> %s (local: %s)", p.iface, target, remoteConn.RemoteAddr(), localAddr)
+
+	// Tell client the tunnel is established
+	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
 	// Bidirectional copy
 	done := make(chan struct{})
 	go func() {
 		io.Copy(remoteConn, clientConn)
-		remoteConn.(*net.TCPConn).CloseWrite()
+		if tc, ok := remoteConn.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
 		close(done)
 	}()
 	io.Copy(clientConn, remoteConn)
