@@ -43,6 +43,13 @@ func NewManager(downloadDir string) *Manager {
 	}
 }
 
+// SetDownloadDir changes the download directory for new tunnels.
+func (m *Manager) SetDownloadDir(dir string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.downloadDir = dir
+}
+
 // CheckDependencies verifies that required tools are installed.
 func CheckDependencies() error {
 	required := []string{"wg", "aria2c"}

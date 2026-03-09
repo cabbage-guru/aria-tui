@@ -88,14 +88,14 @@ func handleCheck() {
 }
 
 func handleTest() {
-	// Test URL: small file from a reliable source
 	testURL := "https://hil-speed.hetzner.com/100MB.bin"
+	ipCheckURL := "https://checkip.amazonaws.com"
 
-	fmt.Println("=== aria-tui end-to-end test ===")
+	fmt.Println("=== aria-tui end-to-end test (2 tunnels) ===")
 	fmt.Println()
 
 	// Step 1: Check dependencies
-	fmt.Print("[1/6] Checking dependencies... ")
+	fmt.Print("[1/7] Checking dependencies... ")
 	if err := tunnel.CheckDependencies(); err != nil {
 		fmt.Printf("FAIL\n  %v\n", err)
 		os.Exit(1)
@@ -103,108 +103,196 @@ func handleTest() {
 	fmt.Println("OK")
 
 	// Step 2: Load VPN configs
-	fmt.Print("[2/6] Loading VPN configs... ")
+	fmt.Print("[2/7] Loading VPN configs... ")
 	pool := vpn.NewPool()
 	if err := pool.LoadConfigs(); err != nil {
 		fmt.Printf("FAIL\n  %v\n", err)
 		os.Exit(1)
 	}
-	if pool.Available() == 0 {
-		fmt.Printf("FAIL\n  No VPN configs available. Import some first:\n")
+	if pool.Available() < 2 {
+		fmt.Printf("FAIL\n  Need at least 2 VPN configs, have %d. Import more:\n", pool.Available())
 		fmt.Printf("  aria-tui import <file.conf>\n")
 		os.Exit(1)
 	}
 	fmt.Printf("OK (%d available)\n", pool.Available())
 
-	// Step 3: Acquire a VPN config
-	fmt.Print("[3/6] Acquiring VPN config... ")
-	wgCfg := pool.Acquire()
-	if wgCfg == nil {
-		fmt.Println("FAIL\n  No VPN config could be acquired")
+	// Step 3: Acquire two VPN configs
+	fmt.Print("[3/7] Acquiring 2 VPN configs... ")
+	wgCfg1 := pool.Acquire()
+	wgCfg2 := pool.Acquire()
+	if wgCfg1 == nil || wgCfg2 == nil {
+		fmt.Println("FAIL\n  Could not acquire 2 VPN configs")
 		os.Exit(1)
 	}
-	fmt.Printf("OK (%s)\n", wgCfg.Name)
-	defer pool.Release(wgCfg.Name)
+	fmt.Printf("OK (%s, %s)\n", wgCfg1.Name, wgCfg2.Name)
+	defer pool.Release(wgCfg1.Name)
+	defer pool.Release(wgCfg2.Name)
 
-	// Step 4: Start tunnel
-	fmt.Print("[4/6] Starting WireGuard tunnel + aria2c... ")
+	// Step 4: Start both tunnels
 	ctx := context.Background()
-	tmpDir, _ := os.MkdirTemp("", "aria-tui-test-*")
-	defer os.RemoveAll(tmpDir)
+	tmpDir1, _ := os.MkdirTemp("", "aria-tui-test1-*")
+	tmpDir2, _ := os.MkdirTemp("", "aria-tui-test2-*")
+	defer os.RemoveAll(tmpDir1)
+	defer os.RemoveAll(tmpDir2)
 
-	tunnelMgr := tunnel.NewManager(tmpDir)
+	tunnelMgr := tunnel.NewManager(tmpDir1)
 	defer tunnelMgr.StopAll(ctx)
 
-	tun, err := tunnelMgr.StartTunnel(ctx, wgCfg.Name, wgCfg.Contents)
+	fmt.Print("[4/7] Starting tunnel 1... ")
+	tun1, err := tunnelMgr.StartTunnel(ctx, wgCfg1.Name, wgCfg1.Contents)
 	if err != nil {
 		fmt.Printf("FAIL\n  %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("OK (iface=%s, port=%d)\n", tun.Interface, tun.RPCPort)
+	fmt.Printf("OK (iface=%s, port=%d)\n", tun1.Interface, tun1.RPCPort)
 
-	// Step 5: Wait for RPC
-	fmt.Print("[5/6] Waiting for aria2c RPC... ")
-	client := download.NewAria2Client(tun.RPCPort, tunnel.RPCSecret(tun.RPCPort))
-	ready := false
+	// Switch download dir for tunnel 2 so IP check file doesn't collide
+	tunnelMgr.SetDownloadDir(tmpDir2)
+
+	fmt.Print("      Starting tunnel 2... ")
+	tun2, err := tunnelMgr.StartTunnel(ctx, wgCfg2.Name, wgCfg2.Contents)
+	if err != nil {
+		fmt.Printf("FAIL\n  %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("OK (iface=%s, port=%d)\n", tun2.Interface, tun2.RPCPort)
+
+	// Step 5: Wait for both RPCs
+	fmt.Print("[5/7] Waiting for aria2c RPC (tunnel 1)... ")
+	client1 := download.NewAria2Client(tun1.RPCPort, tunnel.RPCSecret(tun1.RPCPort))
+	if !waitForRPC(client1, tun1) {
+		os.Exit(1)
+	}
+
+	fmt.Print("      Waiting for aria2c RPC (tunnel 2)... ")
+	client2 := download.NewAria2Client(tun2.RPCPort, tunnel.RPCSecret(tun2.RPCPort))
+	if !waitForRPC(client2, tun2) {
+		os.Exit(1)
+	}
+
+	// Step 6: Check external IPs through each tunnel
+	fmt.Print("[6/7] Checking external IP (tunnel 1)... ")
+	ip1, err := getExternalIP(client1, ipCheckURL, tmpDir1)
+	if err != nil {
+		fmt.Printf("FAIL\n  %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("%s\n", ip1)
+
+	fmt.Print("      Checking external IP (tunnel 2)... ")
+	ip2, err := getExternalIP(client2, ipCheckURL, tmpDir2)
+	if err != nil {
+		fmt.Printf("FAIL\n  %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("%s\n", ip2)
+
+	if ip1 == ip2 {
+		fmt.Printf("\n  WARNING: Both tunnels have the same IP (%s)!\n", ip1)
+		fmt.Println("  Traffic may not be routing through separate VPNs.")
+	} else {
+		fmt.Println("      IPs are different - tunnels are isolated!")
+	}
+
+	// Step 7: Download test file through both tunnels
+	fmt.Printf("[7/7] Downloading test file through tunnel 1... ")
+	if err := testDownload(client1, testURL); err != nil {
+		fmt.Printf("FAIL\n  %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("OK")
+
+	fmt.Printf("      Downloading test file through tunnel 2... ")
+	if err := testDownload(client2, testURL); err != nil {
+		fmt.Printf("FAIL\n  %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("OK")
+
+	fmt.Println()
+	fmt.Println("=== Test passed! ===")
+	fmt.Printf("  Tunnel 1: %s (iface=%s, vpn=%s)\n", ip1, tun1.Interface, wgCfg1.Name)
+	fmt.Printf("  Tunnel 2: %s (iface=%s, vpn=%s)\n", ip2, tun2.Interface, wgCfg2.Name)
+	if ip1 != ip2 {
+		fmt.Println("  IPs differ: traffic is correctly routed through separate VPNs")
+	}
+}
+
+// waitForRPC polls aria2c RPC until ready, returns false on failure.
+func waitForRPC(client *download.Aria2Client, tun *tunnel.Tunnel) bool {
 	for i := 0; i < 20; i++ {
 		if ver, err := client.GetVersion(); err == nil {
 			fmt.Printf("OK (aria2 v%s)\n", ver)
-			ready = true
-			break
+			return true
 		}
 		time.Sleep(time.Second)
 	}
-	if !ready {
-		// Read aria2c log for diagnostics
-		errMsg := "aria2c RPC not ready after 20s"
-		if tun.Aria2Log != "" {
-			if logData, readErr := os.ReadFile(tun.Aria2Log); readErr == nil {
-				if out := strings.TrimSpace(string(logData)); out != "" {
-					errMsg += "\n  aria2c output: " + out
-				}
+	errMsg := "aria2c RPC not ready after 20s"
+	if tun.Aria2Log != "" {
+		if logData, readErr := os.ReadFile(tun.Aria2Log); readErr == nil {
+			if out := strings.TrimSpace(string(logData)); out != "" {
+				errMsg += "\n  aria2c output: " + out
 			}
 		}
-		fmt.Printf("FAIL\n  %s\n", errMsg)
-		os.Exit(1)
 	}
+	fmt.Printf("FAIL\n  %s\n", errMsg)
+	return false
+}
 
-	// Step 6: Download test file
-	fmt.Printf("[6/6] Downloading test file (%s)... ", testURL)
-	gid, err := client.AddURI(testURL)
+// getExternalIP uses aria2c to download from checkip URL and reads the result.
+func getExternalIP(client *download.Aria2Client, checkURL, dir string) (string, error) {
+	gid, err := client.AddURI(checkURL)
 	if err != nil {
-		fmt.Printf("FAIL\n  AddURI error: %v\n", err)
-		os.Exit(1)
+		return "", fmt.Errorf("AddURI: %v", err)
 	}
 
-	// Poll until complete or error (max 60s)
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		time.Sleep(time.Second)
+		time.Sleep(500 * time.Millisecond)
 		status, err := client.TellStatus(gid)
 		if err != nil {
 			continue
 		}
 		switch status.Status {
 		case "complete":
-			filename := ""
 			if len(status.Files) > 0 && status.Files[0].Path != "" {
-				filename = filepath.Base(status.Files[0].Path)
+				data, err := os.ReadFile(status.Files[0].Path)
+				if err != nil {
+					return "", fmt.Errorf("reading IP file: %v", err)
+				}
+				os.Remove(status.Files[0].Path)
+				return strings.TrimSpace(string(data)), nil
 			}
-			fmt.Printf("OK\n")
-			fmt.Println()
-			fmt.Println("=== Test passed! ===")
-			fmt.Printf("  File:      %s\n", filename)
-			fmt.Printf("  Size:      %d bytes\n", status.CompletedLength)
-			fmt.Printf("  Interface: %s\n", tun.Interface)
-			fmt.Printf("  VPN:       %s\n", wgCfg.Name)
-			return
+			return "", fmt.Errorf("no file path in completed download")
 		case "error":
-			fmt.Printf("FAIL\n  aria2c error: [%s] %s\n", status.ErrorCode, status.ErrorMessage)
-			os.Exit(1)
+			return "", fmt.Errorf("aria2c error [%s]: %s", status.ErrorCode, status.ErrorMessage)
 		}
 	}
-	fmt.Println("FAIL\n  Download timed out after 60s")
-	os.Exit(1)
+	return "", fmt.Errorf("timed out after 30s")
+}
+
+// testDownload downloads a file via aria2c and waits for completion.
+func testDownload(client *download.Aria2Client, url string) error {
+	gid, err := client.AddURI(url)
+	if err != nil {
+		return fmt.Errorf("AddURI: %v", err)
+	}
+
+	deadline := time.Now().Add(120 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(2 * time.Second)
+		status, err := client.TellStatus(gid)
+		if err != nil {
+			continue
+		}
+		switch status.Status {
+		case "complete":
+			return nil
+		case "error":
+			return fmt.Errorf("aria2c error [%s]: %s", status.ErrorCode, status.ErrorMessage)
+		}
+	}
+	return fmt.Errorf("timed out after 120s")
 }
 
 func handleImport() {
