@@ -78,6 +78,11 @@ func installHint(missing []string) string {
 
 // StartTunnel creates a WireGuard interface, configures it, and starts aria2c bound to it.
 func (m *Manager) StartTunnel(ctx context.Context, name string, wgConfigContents string) (*Tunnel, error) {
+	// WireGuard tunnel creation requires root (TUN device + /var/run/wireguard)
+	if os.Geteuid() != 0 {
+		return nil, fmt.Errorf("tunnel requires root privileges. Run with: sudo %s", os.Args[0])
+	}
+
 	m.mu.Lock()
 	port := m.nextPort
 	m.nextPort++
