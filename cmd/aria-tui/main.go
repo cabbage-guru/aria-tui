@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -170,8 +173,18 @@ func handleTest() {
 		os.Exit(1)
 	}
 
-	// Step 6: Check external IPs through each tunnel
-	fmt.Print("[6/7] Checking external IP (tunnel 1)... ")
+	// Step 6: Check external IPs (host + both tunnels)
+	fmt.Print("[6/8] Checking host external IP... ")
+	hostIP, err := getHostExternalIP(ipCheckURL)
+	if err != nil {
+		fmt.Printf("FAIL\n  %v\n", err)
+		fmt.Println("  (continuing anyway)")
+		hostIP = "unknown"
+	} else {
+		fmt.Printf("%s\n", hostIP)
+	}
+
+	fmt.Print("[7/8] Checking external IP (tunnel 1)... ")
 	ip1, err := getExternalIP(client1, ipCheckURL, tmpDir1)
 	if err != nil {
 		fmt.Printf("FAIL\n  %v\n", err)
@@ -187,15 +200,38 @@ func handleTest() {
 	}
 	fmt.Printf("%s\n", ip2)
 
-	if ip1 == ip2 {
-		fmt.Printf("\n  WARNING: Both tunnels have the same IP (%s)!\n", ip1)
-		fmt.Println("  Traffic may not be routing through separate VPNs.")
+	fmt.Println()
+
+	// Print diagnostics
+	fmt.Println("--- IP comparison ---")
+	fmt.Printf("  Host:     %s\n", hostIP)
+	fmt.Printf("  Tunnel 1: %s\n", ip1)
+	fmt.Printf("  Tunnel 2: %s\n", ip2)
+
+	allSame := ip1 == hostIP && ip2 == hostIP
+	tunnelsSame := ip1 == ip2
+
+	if allSame {
+		fmt.Println()
+		fmt.Println("  PROBLEM: All IPs are the same!")
+		fmt.Println("  Tunnels are NOT routing through VPN at all.")
+	} else if tunnelsSame {
+		fmt.Println()
+		fmt.Printf("  WARNING: Both tunnels share the same IP (%s)\n", ip1)
+		if ip1 != hostIP {
+			fmt.Println("  They differ from host, so VPN is working but both use the same exit.")
+		}
 	} else {
-		fmt.Println("      IPs are different - tunnels are isolated!")
+		fmt.Println("  Tunnels have different IPs - isolation confirmed!")
 	}
 
-	// Step 7: Download test file through both tunnels
-	fmt.Printf("[7/7] Downloading test file through tunnel 1... ")
+	// Print routing diagnostics
+	fmt.Println()
+	fmt.Println("--- Routing diagnostics ---")
+	printDiagnostics(tun1.Interface, tun2.Interface)
+
+	// Step 8: Download test file through both tunnels
+	fmt.Printf("\n[8/8] Downloading test file through tunnel 1... ")
 	if err := testDownload(client1, testURL); err != nil {
 		fmt.Printf("FAIL\n  %v\n", err)
 		os.Exit(1)
@@ -211,10 +247,75 @@ func handleTest() {
 
 	fmt.Println()
 	fmt.Println("=== Test passed! ===")
+	fmt.Printf("  Host:     %s\n", hostIP)
 	fmt.Printf("  Tunnel 1: %s (iface=%s, vpn=%s)\n", ip1, tun1.Interface, wgCfg1.Name)
 	fmt.Printf("  Tunnel 2: %s (iface=%s, vpn=%s)\n", ip2, tun2.Interface, wgCfg2.Name)
 	if ip1 != ip2 {
 		fmt.Println("  IPs differ: traffic is correctly routed through separate VPNs")
+	}
+}
+
+// getHostExternalIP fetches the host's external IP directly (no tunnel).
+func getHostExternalIP(checkURL string) (string, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(checkURL)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(body)), nil
+}
+
+// printDiagnostics dumps routing and WireGuard state for debugging.
+func printDiagnostics(ifaces ...string) {
+	// Show WireGuard status
+	fmt.Println("  wg show:")
+	if out, err := exec.Command("sudo", "wg", "show").CombinedOutput(); err == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			fmt.Printf("    %s\n", line)
+		}
+	} else {
+		fmt.Printf("    (error: %v)\n", err)
+	}
+
+	// Show ip rules
+	fmt.Println("  ip rule list:")
+	if out, err := exec.Command("ip", "rule", "list").CombinedOutput(); err == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			fmt.Printf("    %s\n", line)
+		}
+	}
+
+	// Show routing tables for our tunnels (51820+)
+	for i, iface := range ifaces {
+		tableID := 51820 + i
+		fmt.Printf("  ip route show table %d (iface %s):\n", tableID, iface)
+		if out, err := exec.Command("ip", "route", "show", "table", fmt.Sprintf("%d", tableID)).CombinedOutput(); err == nil {
+			output := strings.TrimSpace(string(out))
+			if output == "" {
+				fmt.Println("    (empty)")
+			} else {
+				for _, line := range strings.Split(output, "\n") {
+					fmt.Printf("    %s\n", line)
+				}
+			}
+		}
+	}
+
+	// Show interface addresses
+	for _, iface := range ifaces {
+		fmt.Printf("  ip addr show %s:\n", iface)
+		if out, err := exec.Command("ip", "addr", "show", iface).CombinedOutput(); err == nil {
+			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+				fmt.Printf("    %s\n", line)
+			}
+		} else {
+			fmt.Printf("    (error: %v)\n", err)
+		}
 	}
 }
 
