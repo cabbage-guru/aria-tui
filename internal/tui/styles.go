@@ -77,6 +77,12 @@ var (
 	vpnAvailableStyle = lipgloss.NewStyle().
 				Foreground(mutedColor)
 
+	vpnDisabledStyle = lipgloss.NewStyle().
+				Foreground(errorColor)
+
+	vpnCooldownStyle = lipgloss.NewStyle().
+				Foreground(warningColor)
+
 	boxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(primaryColor).

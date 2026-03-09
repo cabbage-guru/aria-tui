@@ -28,6 +28,8 @@ const (
 	StatusCancelled
 )
 
+const cooldownDuration = 5 * time.Minute
+
 func (s Status) String() string {
 	switch s {
 	case StatusQueued:
@@ -68,6 +70,7 @@ type Download struct {
 	LastProgress  time.Time // last time we saw bytes increase
 	LastBytes     int64     // bytes at last progress check
 	StaleNotified bool
+	RateLimited   bool // true if this download hit a 429
 }
 
 func (d *Download) Progress() float64 {
@@ -87,6 +90,14 @@ func (d *Download) TotalStr() string {
 
 func (d *Download) CompletedStr() string {
 	return formatBytes(d.CompletedSize)
+}
+
+// StaleDuration returns how long this download has been without progress.
+func (d *Download) StaleDuration() time.Duration {
+	if d.LastProgress.IsZero() {
+		return 0
+	}
+	return time.Since(d.LastProgress)
 }
 
 func formatBytes(b int64) string {
@@ -222,6 +233,7 @@ func (m *Manager) Restart(id string) {
 			d.VPNConfig = ""
 			d.Interface = ""
 			d.StaleNotified = false
+			d.RateLimited = false
 			d.LastProgress = time.Time{}
 			d.LastBytes = 0
 			m.queue = append(m.queue, d.ID)
@@ -252,6 +264,11 @@ func (m *Manager) Remove(id string) {
 			break
 		}
 	}
+}
+
+// StaleTimeout returns the configured stale timeout duration.
+func (m *Manager) StaleTimeout() time.Duration {
+	return time.Duration(m.cfg.StaleTimeoutMins) * time.Minute
 }
 
 func (m *Manager) processLoop() {
@@ -401,6 +418,20 @@ func (m *Manager) monitorLoop() {
 	}
 }
 
+// isRateLimited checks if an aria2c error indicates a 429 Too Many Requests.
+func isRateLimited(errorCode, errorMessage string) bool {
+	if strings.Contains(errorMessage, "429") {
+		return true
+	}
+	if strings.Contains(strings.ToLower(errorMessage), "too many requests") {
+		return true
+	}
+	if strings.Contains(strings.ToLower(errorMessage), "rate limit") {
+		return true
+	}
+	return false
+}
+
 func (m *Manager) updateStatuses() {
 	m.mu.RLock()
 	active := make([]*Download, 0)
@@ -439,6 +470,14 @@ func (m *Manager) updateStatuses() {
 		case "error":
 			dl.Status = StatusError
 			dl.Error = fmt.Sprintf("aria2 error %s: %s", status.ErrorCode, status.ErrorMessage)
+
+			// Detect 429 rate limiting and put VPN on cooldown
+			if isRateLimited(status.ErrorCode, status.ErrorMessage) {
+				dl.RateLimited = true
+				dl.Error = fmt.Sprintf("Rate limited (429) - VPN %s on cooldown for 5m", dl.VPNConfig)
+				m.vpnPool.SetCooldown(dl.VPNConfig, cooldownDuration)
+			}
+
 			go m.cleanupDownload(dl)
 			m.mu.Unlock()
 			m.recordHistory(dl)

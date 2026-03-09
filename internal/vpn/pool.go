@@ -7,29 +7,36 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cabbage-guru/aria-tui/internal/config"
 )
 
 // WireGuardConfig represents a WireGuard configuration file.
 type WireGuardConfig struct {
-	Name     string
-	Path     string
-	InUse    bool
-	Contents string
+	Name          string
+	Path          string
+	InUse         bool
+	Disabled      bool
+	CooldownUntil time.Time
+	Contents      string
 }
 
 // Pool manages WireGuard configurations.
 type Pool struct {
-	mu      sync.Mutex
-	configs map[string]*WireGuardConfig
-	inUse   map[string]bool // config name -> in use
+	mu       sync.Mutex
+	configs  map[string]*WireGuardConfig
+	inUse    map[string]bool      // config name -> in use
+	disabled map[string]bool      // config name -> manually disabled
+	cooldown map[string]time.Time // config name -> cooldown expiry
 }
 
 func NewPool() *Pool {
 	return &Pool{
-		configs: make(map[string]*WireGuardConfig),
-		inUse:   make(map[string]bool),
+		configs:  make(map[string]*WireGuardConfig),
+		inUse:    make(map[string]bool),
+		disabled: make(map[string]bool),
+		cooldown: make(map[string]time.Time),
 	}
 }
 
@@ -130,6 +137,8 @@ func (p *Pool) RemoveConfig(name string) error {
 	}
 
 	delete(p.configs, name)
+	delete(p.disabled, name)
+	delete(p.cooldown, name)
 	return nil
 }
 
@@ -138,12 +147,22 @@ func (p *Pool) Acquire() *WireGuardConfig {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	now := time.Now()
 	for name, cfg := range p.configs {
-		if !p.inUse[name] {
-			p.inUse[name] = true
-			cfg.InUse = true
-			return cfg
+		if p.inUse[name] {
+			continue
 		}
+		if p.disabled[name] {
+			continue
+		}
+		if expiry, ok := p.cooldown[name]; ok && now.Before(expiry) {
+			continue
+		}
+		// Clear expired cooldown
+		delete(p.cooldown, name)
+		p.inUse[name] = true
+		cfg.InUse = true
+		return cfg
 	}
 	return nil
 }
@@ -159,16 +178,62 @@ func (p *Pool) Release(name string) {
 	}
 }
 
-// Available returns the number of configs not currently in use.
+// Disable manually disables a VPN config. If it's currently marked stale,
+// this also clears any cooldown.
+func (p *Pool) Disable(name string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.disabled[name] = true
+	delete(p.cooldown, name)
+}
+
+// Enable manually enables a VPN config and clears any cooldown.
+func (p *Pool) Enable(name string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.disabled, name)
+	delete(p.cooldown, name)
+}
+
+// IsDisabled returns whether a config is manually disabled.
+func (p *Pool) IsDisabled(name string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.disabled[name]
+}
+
+// SetCooldown puts a VPN on cooldown for the given duration (e.g., after 429).
+func (p *Pool) SetCooldown(name string, d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cooldown[name] = time.Now().Add(d)
+}
+
+// GetCooldownUntil returns the cooldown expiry for a config, or zero time if none.
+func (p *Pool) GetCooldownUntil(name string) time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cooldown[name]
+}
+
+// Available returns the number of configs not currently in use, disabled, or on cooldown.
 func (p *Pool) Available() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	now := time.Now()
 	count := 0
 	for name := range p.configs {
-		if !p.inUse[name] {
-			count++
+		if p.inUse[name] {
+			continue
 		}
+		if p.disabled[name] {
+			continue
+		}
+		if expiry, ok := p.cooldown[name]; ok && now.Before(expiry) {
+			continue
+		}
+		count++
 	}
 	return count
 }
@@ -187,15 +252,20 @@ func (p *Pool) InUseCount() int {
 	return len(p.inUse)
 }
 
-// List returns all configs sorted by name.
+// List returns all configs sorted by name with current state.
 func (p *Pool) List() []*WireGuardConfig {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	now := time.Now()
 	result := make([]*WireGuardConfig, 0, len(p.configs))
 	for _, cfg := range p.configs {
 		c := *cfg
 		c.InUse = p.inUse[cfg.Name]
+		c.Disabled = p.disabled[cfg.Name]
+		if expiry, ok := p.cooldown[cfg.Name]; ok && now.Before(expiry) {
+			c.CooldownUntil = expiry
+		}
 		result = append(result, &c)
 	}
 

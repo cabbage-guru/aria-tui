@@ -17,7 +17,7 @@ func DefaultConfig() *Config {
 	return &Config{
 		MaxConcurrent:    5,
 		DownloadDir:      filepath.Join(homeDir(), "Downloads", "aria-tui"),
-		StaleTimeoutMins: 5,
+		StaleTimeoutMins: 2,
 	}
 }
 

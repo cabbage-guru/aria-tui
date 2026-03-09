@@ -288,6 +288,22 @@ func (m Model) handleVPNKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case "e":
+		// Toggle enable/disable
+		if m.cursor < len(configs) {
+			cfg := configs[m.cursor]
+			if cfg.InUse {
+				m.setMessage("Cannot disable config while in use")
+			} else if cfg.Disabled {
+				m.vpnPool.Enable(cfg.Name)
+				m.setMessage(fmt.Sprintf("Enabled %s", cfg.Name))
+			} else {
+				m.vpnPool.Disable(cfg.Name)
+				m.setMessage(fmt.Sprintf("Disabled %s", cfg.Name))
+			}
+		}
+		return m, nil
+
 	case "R":
 		// Reload configs
 		if err := m.vpnPool.LoadConfigs(); err != nil {
@@ -549,6 +565,17 @@ func (m Model) renderDownloads() string {
 				dl.CompletedStr(), dl.TotalStr(),
 				dl.SpeedStr(),
 				dl.VPNConfig)
+
+			// Show time without progress for active downloads approaching stale
+			staleDur := dl.StaleDuration()
+			staleTimeout := m.dlMgr.StaleTimeout()
+			if dl.Status == download.StatusDownloading && staleDur > 30*time.Second {
+				remaining := staleTimeout - staleDur
+				if remaining > 0 {
+					info += fmt.Sprintf("  idle %s/%s", staleDur.Truncate(time.Second), staleTimeout.Truncate(time.Second))
+				}
+			}
+
 			b.WriteString(progressBarStyle.Render(info) + "\n")
 		}
 
@@ -559,7 +586,8 @@ func (m Model) renderDownloads() string {
 
 		// Stale warning
 		if dl.Status == download.StatusStale {
-			b.WriteString(statusStaleStyle.Render("   No progress for 5+ minutes. Press 'r' to restart.") + "\n")
+			staleDur := dl.StaleDuration().Truncate(time.Second)
+			b.WriteString(statusStaleStyle.Render(fmt.Sprintf("   No progress for %s. Press 'r' to restart.", staleDur)) + "\n")
 		}
 	}
 
@@ -586,7 +614,12 @@ func (m Model) renderVPN() string {
 		}
 
 		var status string
-		if cfg.InUse {
+		if cfg.Disabled {
+			status = vpnDisabledStyle.Render("[DISABLED]")
+		} else if !cfg.CooldownUntil.IsZero() {
+			remaining := time.Until(cfg.CooldownUntil).Truncate(time.Second)
+			status = vpnCooldownStyle.Render(fmt.Sprintf("[COOLDOWN %s]", remaining))
+		} else if cfg.InUse {
 			status = vpnInUseStyle.Render("[IN USE]")
 		} else {
 			status = vpnAvailableStyle.Render("[AVAILABLE]")
@@ -713,7 +746,7 @@ func (m Model) renderHelp() string {
 	case tabDownloads:
 		help = "a:add  r:restart  c:cancel  d:remove  1-4:tabs  q:quit"
 	case tabVPN:
-		help = "a:add  i:import  d:delete  R:reload  1-4:tabs  q:quit"
+		help = "a:add  i:import  d:delete  e:enable/disable  R:reload  1-4:tabs  q:quit"
 	case tabHistory:
 		help = "C:clear history  1-4:tabs  q:quit"
 	case tabSettings:
