@@ -468,16 +468,30 @@ func (m *Manager) updateStatuses() {
 			continue
 
 		case "error":
-			dl.Status = StatusError
-			dl.Error = fmt.Sprintf("aria2 error %s: %s", status.ErrorCode, status.ErrorMessage)
-
-			// Detect 429 rate limiting and put VPN on cooldown
+			// Detect 429 rate limiting: cooldown the VPN and retry on a different one
 			if isRateLimited(status.ErrorCode, status.ErrorMessage) {
 				dl.RateLimited = true
-				dl.Error = fmt.Sprintf("Rate limited (429) - VPN %s on cooldown for 5m", dl.VPNConfig)
-				m.vpnPool.SetCooldown(dl.VPNConfig, cooldownDuration)
+				rateLimitedVPN := dl.VPNConfig
+				m.vpnPool.SetCooldown(rateLimitedVPN, cooldownDuration)
+				go m.cleanupDownload(dl)
+
+				// Re-queue for retry on a different VPN
+				dl.Status = StatusQueued
+				dl.Error = fmt.Sprintf("Rate limited (429) on %s - retrying on different VPN", rateLimitedVPN)
+				dl.GID = ""
+				dl.RPCPort = 0
+				dl.VPNConfig = ""
+				dl.Interface = ""
+				dl.StaleNotified = false
+				dl.LastProgress = time.Time{}
+				dl.LastBytes = 0
+				m.queue = append(m.queue, dl.ID)
+				m.mu.Unlock()
+				continue
 			}
 
+			dl.Status = StatusError
+			dl.Error = fmt.Sprintf("aria2 error %s: %s", status.ErrorCode, status.ErrorMessage)
 			go m.cleanupDownload(dl)
 			m.mu.Unlock()
 			m.recordHistory(dl)
