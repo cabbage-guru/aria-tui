@@ -1,0 +1,4 @@
+aria-tui
+*.exe
+*.conf
+!docker/example-wg.conf
