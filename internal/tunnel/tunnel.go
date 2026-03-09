@@ -149,17 +149,19 @@ func (m *Manager) StartTunnel(ctx context.Context, name string, wgConfigContents
 	}
 	os.Remove(confFile) // no longer needed
 
+	// Parse the local IP from the address for routing and aria2c binding
+	parsedIP, _, _ := net.ParseCIDR(address)
+	if parsedIP == nil {
+		parsedIP = net.ParseIP(address)
+	}
+	localIP := ""
+	if parsedIP != nil {
+		localIP = parsedIP.String()
+	}
+
 	// Set up policy routing so traffic through this interface uses the VPN
 	allowedIPs := parseAllowedIPs(wgConfigContents)
 	if len(allowedIPs) > 0 {
-		ip, _, _ := net.ParseCIDR(address)
-		if ip == nil {
-			ip = net.ParseIP(address)
-		}
-		localIP := ""
-		if ip != nil {
-			localIP = ip.String()
-		}
 		if err := setupRouting(tunnelCtx, actualIface, localIP, allowedIPs, tableID, fwmark); err != nil {
 			killWg()
 			cancel()
@@ -168,8 +170,12 @@ func (m *Manager) StartTunnel(ctx context.Context, name string, wgConfigContents
 		}
 	}
 
-	// Start aria2c bound to this interface
-	aria2Cmd, aria2LogPath, err := startAria2c(tunnelCtx, actualIface, port, m.downloadDir)
+	// Start aria2c bound to the WireGuard IP (not interface name, which needs CAP_NET_RAW)
+	bindAddr := localIP
+	if bindAddr == "" {
+		bindAddr = actualIface // fallback to interface name if no IP parsed
+	}
+	aria2Cmd, aria2LogPath, err := startAria2c(tunnelCtx, bindAddr, port, m.downloadDir)
 	if err != nil {
 		cleanupRouting(tableID, fwmark)
 		killWg()
@@ -603,8 +609,11 @@ func cleanupRouting(tableID, fwmark int) {
 	sudoCmdNoCtx("ip", "route", "flush", "table", tStr).Run()
 }
 
-// startAria2c launches an aria2c process bound to the given interface.
-func startAria2c(ctx context.Context, iface string, port int, downloadDir string) (*exec.Cmd, string, error) {
+// startAria2c launches an aria2c process bound to the given source IP.
+// We use the IP address rather than the interface name because --interface=<name>
+// requires CAP_NET_RAW for SO_BINDTODEVICE. Using an IP uses bind() instead,
+// and our policy routing rules handle routing traffic through the correct interface.
+func startAria2c(ctx context.Context, sourceIP string, port int, downloadDir string) (*exec.Cmd, string, error) {
 	args := []string{
 		"--enable-rpc=true",
 		"--rpc-listen-all=false",
@@ -613,7 +622,7 @@ func startAria2c(ctx context.Context, iface string, port int, downloadDir string
 		"--disable-ipv6=true",
 		fmt.Sprintf("--rpc-secret=%s", rpcSecret(port)),
 		fmt.Sprintf("--dir=%s", downloadDir),
-		fmt.Sprintf("--interface=%s", iface),
+		fmt.Sprintf("--interface=%s", sourceIP),
 		fmt.Sprintf("--file-allocation=%s", fileAllocMethod()),
 		"--continue=true",
 		"--max-connection-per-server=4",
