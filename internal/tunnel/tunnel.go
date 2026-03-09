@@ -16,15 +16,18 @@ import (
 
 // Tunnel represents an active WireGuard tunnel with an interface.
 type Tunnel struct {
-	Name      string
-	Interface string // e.g. utun5, wg0
-	VPNConfig string
-	RPCPort   int
-	Aria2Cmd  *exec.Cmd
-	Aria2Log  string // path to aria2c log file for debugging
-	WGCmd     *exec.Cmd // wireguard-go process
-	Created   time.Time
-	cancel    context.CancelFunc
+	Name       string
+	Interface  string // e.g. utun5, wg0
+	VPNConfig  string
+	RPCPort    int
+	Aria2Cmd   *exec.Cmd
+	Aria2Log   string // path to aria2c log file for debugging
+	WGCmd      *exec.Cmd // wireguard-go process
+	Created    time.Time
+	cancel     context.CancelFunc
+	routeTable int    // Linux routing table ID for policy routing
+	fwmark     int    // fwmark value for this tunnel
+	localIP    string // IP address assigned to the WireGuard interface
 }
 
 // Manager handles WireGuard tunnel lifecycle without Docker.
@@ -32,6 +35,7 @@ type Manager struct {
 	mu          sync.Mutex
 	tunnels     map[string]*Tunnel
 	nextPort    int
+	nextTableID int // Linux routing table ID (starting at 51820)
 	downloadDir string
 }
 
@@ -39,6 +43,7 @@ func NewManager(downloadDir string) *Manager {
 	return &Manager{
 		tunnels:     make(map[string]*Tunnel),
 		nextPort:    6800,
+		nextTableID: 51820,
 		downloadDir: downloadDir,
 	}
 }
@@ -89,7 +94,11 @@ func (m *Manager) StartTunnel(ctx context.Context, name string, wgConfigContents
 	m.mu.Lock()
 	port := m.nextPort
 	m.nextPort++
+	tableID := m.nextTableID
+	m.nextTableID++
 	m.mu.Unlock()
+
+	fwmark := tableID // use same value for simplicity
 
 	tunnelCtx, cancel := context.WithCancel(ctx)
 
@@ -140,9 +149,29 @@ func (m *Manager) StartTunnel(ctx context.Context, name string, wgConfigContents
 	}
 	os.Remove(confFile) // no longer needed
 
+	// Set up policy routing so traffic through this interface uses the VPN
+	allowedIPs := parseAllowedIPs(wgConfigContents)
+	if len(allowedIPs) > 0 {
+		ip, _, _ := net.ParseCIDR(address)
+		if ip == nil {
+			ip = net.ParseIP(address)
+		}
+		localIP := ""
+		if ip != nil {
+			localIP = ip.String()
+		}
+		if err := setupRouting(tunnelCtx, actualIface, localIP, allowedIPs, tableID, fwmark); err != nil {
+			killWg()
+			cancel()
+			removeInterface(actualIface)
+			return nil, fmt.Errorf("setting up routing: %w", err)
+		}
+	}
+
 	// Start aria2c bound to this interface
 	aria2Cmd, aria2LogPath, err := startAria2c(tunnelCtx, actualIface, port, m.downloadDir)
 	if err != nil {
+		cleanupRouting(tableID, fwmark)
 		killWg()
 		cancel()
 		removeInterface(actualIface)
@@ -150,15 +179,17 @@ func (m *Manager) StartTunnel(ctx context.Context, name string, wgConfigContents
 	}
 
 	t := &Tunnel{
-		Name:      name,
-		Interface: actualIface,
-		VPNConfig: name,
-		RPCPort:   port,
-		Aria2Cmd:  aria2Cmd,
-		Aria2Log:  aria2LogPath,
-		WGCmd:     wgCmd,
-		Created:   time.Now(),
-		cancel:    cancel,
+		Name:       name,
+		Interface:  actualIface,
+		VPNConfig:  name,
+		RPCPort:    port,
+		Aria2Cmd:   aria2Cmd,
+		Aria2Log:   aria2LogPath,
+		WGCmd:      wgCmd,
+		Created:    time.Now(),
+		cancel:     cancel,
+		routeTable: tableID,
+		fwmark:     fwmark,
 	}
 
 	m.mu.Lock()
@@ -203,6 +234,11 @@ func stopTunnel(t *Tunnel) error {
 			t.WGCmd.Process.Kill()
 		}
 		t.WGCmd.Wait()
+	}
+
+	// Clean up policy routing
+	if t.routeTable != 0 {
+		cleanupRouting(t.routeTable, t.fwmark)
 	}
 
 	// Remove the interface
@@ -501,6 +537,72 @@ func configureInterface(ctx context.Context, iface string, confFile string, addr
 	return nil
 }
 
+// setupRouting configures policy routing so traffic bound to the WireGuard interface
+// actually routes through it. On Linux, this uses fwmark + ip rule + ip route.
+//
+// The approach mirrors `wg-quick`:
+// 1. Mark WireGuard's own UDP packets with fwmark so they use the main table
+// 2. Add an ip rule so all other traffic uses our custom routing table
+// 3. Add routes in the custom table through the WireGuard interface
+//
+// Combined with aria2c's --interface (SO_BINDTODEVICE), this ensures downloads
+// go through the VPN tunnel while WireGuard's encrypted packets reach the endpoint.
+func setupRouting(ctx context.Context, iface string, localIP string, allowedIPs []string, tableID, fwmark int) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+
+	tStr := fmt.Sprintf("%d", tableID)
+	fStr := fmt.Sprintf("%d", fwmark)
+
+	// Mark WireGuard's own encrypted UDP packets so they bypass the custom table
+	wgCmd := sudoCmd(ctx, "wg", "set", iface, "fwmark", fStr)
+	if out, err := wgCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("wg set fwmark: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	// Add routes in custom table for AllowedIPs through the WireGuard interface
+	for _, cidr := range allowedIPs {
+		if cidr == "0.0.0.0/0" {
+			// Default route through the WireGuard interface
+			routeCmd := sudoCmd(ctx, "ip", "route", "add", "default", "dev", iface, "table", tStr)
+			if out, err := routeCmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("ip route add default: %s: %w", strings.TrimSpace(string(out)), err)
+			}
+		} else {
+			routeCmd := sudoCmd(ctx, "ip", "route", "add", cidr, "dev", iface, "table", tStr)
+			if out, err := routeCmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("ip route add %s: %s: %w", cidr, strings.TrimSpace(string(out)), err)
+			}
+		}
+	}
+
+	// Rule: traffic from the WireGuard interface's IP uses our custom table
+	// (unless it's already marked as WireGuard's own encrypted traffic)
+	if localIP != "" {
+		ruleCmd := sudoCmd(ctx, "ip", "rule", "add", "from", localIP, "not", "fwmark", fStr, "table", tStr)
+		if out, err := ruleCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("ip rule add: %s: %w", strings.TrimSpace(string(out)), err)
+		}
+	}
+
+	return nil
+}
+
+// cleanupRouting removes policy routing rules for a tunnel.
+func cleanupRouting(tableID, fwmark int) {
+	if runtime.GOOS != "linux" {
+		return
+	}
+	tStr := fmt.Sprintf("%d", tableID)
+	fStr := fmt.Sprintf("%d", fwmark)
+	// Remove the ip rule (best effort, may already be gone)
+	sudoCmdNoCtx("ip", "rule", "del", "table", tStr).Run()
+	_ = fStr // fwmark used in rule matching but del by table is sufficient
+	// Flush the routing table
+	sudoCmdNoCtx("ip", "route", "flush", "table", tStr).Run()
+}
+
 // startAria2c launches an aria2c process bound to the given interface.
 func startAria2c(ctx context.Context, iface string, port int, downloadDir string) (*exec.Cmd, string, error) {
 	args := []string{
@@ -616,6 +718,26 @@ func parseAddress(config string) string {
 		}
 	}
 	return ""
+}
+
+// parseAllowedIPs extracts AllowedIPs from [Peer] sections of a WireGuard config.
+func parseAllowedIPs(config string) []string {
+	var result []string
+	for _, line := range strings.Split(config, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToLower(line), "allowedips") {
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 {
+				for _, cidr := range strings.Split(parts[1], ",") {
+					cidr = strings.TrimSpace(cidr)
+					if cidr != "" && strings.Contains(cidr, ".") { // IPv4 only
+						result = append(result, cidr)
+					}
+				}
+			}
+		}
+	}
+	return result
 }
 
 // stripInterfaceExtras removes lines that wg setconf doesn't understand
