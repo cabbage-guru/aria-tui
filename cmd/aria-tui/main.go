@@ -147,7 +147,11 @@ func handleTest() {
 		fmt.Printf("FAIL\n  %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("OK (iface=%s, port=%d)\n", tun1.Interface, tun1.RPCPort)
+	socksPort1 := 0
+	if tun1.SocksProxy != nil {
+		socksPort1 = tun1.SocksProxy.Port()
+	}
+	fmt.Printf("OK (iface=%s, rpc=%d, socks=%d)\n", tun1.Interface, tun1.RPCPort, socksPort1)
 
 	// Switch download dir for tunnel 2 so IP check file doesn't collide
 	tunnelMgr.SetDownloadDir(tmpDir2)
@@ -158,7 +162,11 @@ func handleTest() {
 		fmt.Printf("FAIL\n  %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("OK (iface=%s, port=%d)\n", tun2.Interface, tun2.RPCPort)
+	socksPort2 := 0
+	if tun2.SocksProxy != nil {
+		socksPort2 = tun2.SocksProxy.Port()
+	}
+	fmt.Printf("OK (iface=%s, rpc=%d, socks=%d)\n", tun2.Interface, tun2.RPCPort, socksPort2)
 
 	// Step 5: Wait for both RPCs
 	fmt.Print("[5/7] Waiting for aria2c RPC (tunnel 1)... ")

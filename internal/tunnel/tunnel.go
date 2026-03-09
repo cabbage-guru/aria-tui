@@ -23,11 +23,11 @@ type Tunnel struct {
 	Aria2Cmd   *exec.Cmd
 	Aria2Log   string // path to aria2c log file for debugging
 	WGCmd      *exec.Cmd // wireguard-go process
+	SocksProxy *SocksProxy // SOCKS5 proxy that routes through this tunnel
 	Created    time.Time
 	cancel     context.CancelFunc
 	routeTable int    // Linux routing table ID for policy routing
 	fwmark     int    // fwmark value for this tunnel
-	localIP    string // IP address assigned to the WireGuard interface
 }
 
 // Manager handles WireGuard tunnel lifecycle without Docker.
@@ -170,14 +170,22 @@ func (m *Manager) StartTunnel(ctx context.Context, name string, wgConfigContents
 		}
 	}
 
-	// Start aria2c bound to the WireGuard IP (not interface name, which needs CAP_NET_RAW)
-	bindAddr := localIP
-	if bindAddr == "" {
-		bindAddr = actualIface // fallback to interface name if no IP parsed
-	}
-	aria2Cmd, aria2LogPath, err := startAria2c(tunnelCtx, bindAddr, port, m.downloadDir)
+	// Start a SOCKS5 proxy that forces connections through the WireGuard interface
+	// using IP_BOUND_IF (macOS) or SO_BINDTODEVICE (Linux). This is more reliable
+	// than aria2c's --interface which only uses bind().
+	socksProxy, err := StartSocksProxy(tunnelCtx, actualIface)
 	if err != nil {
-		cleanupRouting(tableID, fwmark)
+		cleanupRouting(actualIface, tableID, fwmark)
+		killWg()
+		cancel()
+		removeInterface(actualIface)
+		return nil, fmt.Errorf("starting SOCKS proxy: %w", err)
+	}
+
+	aria2Cmd, aria2LogPath, err := startAria2c(tunnelCtx, socksProxy.Port(), port, m.downloadDir)
+	if err != nil {
+		socksProxy.Stop()
+		cleanupRouting(actualIface, tableID, fwmark)
 		killWg()
 		cancel()
 		removeInterface(actualIface)
@@ -192,6 +200,7 @@ func (m *Manager) StartTunnel(ctx context.Context, name string, wgConfigContents
 		Aria2Cmd:   aria2Cmd,
 		Aria2Log:   aria2LogPath,
 		WGCmd:      wgCmd,
+		SocksProxy: socksProxy,
 		Created:    time.Now(),
 		cancel:     cancel,
 		routeTable: tableID,
@@ -231,6 +240,11 @@ func stopTunnel(t *Tunnel) error {
 		t.Aria2Cmd.Wait()
 	}
 
+	// Stop SOCKS proxy
+	if t.SocksProxy != nil {
+		t.SocksProxy.Stop()
+	}
+
 	// Kill wireguard-go (may be running as root via sudo)
 	if t.WGCmd != nil && t.WGCmd.Process != nil {
 		if needsSudo() {
@@ -244,7 +258,7 @@ func stopTunnel(t *Tunnel) error {
 
 	// Clean up policy routing
 	if t.routeTable != 0 {
-		cleanupRouting(t.routeTable, t.fwmark)
+		cleanupRouting(t.Interface, t.routeTable, t.fwmark)
 	}
 
 	// Remove the interface
@@ -554,10 +568,24 @@ func configureInterface(ctx context.Context, iface string, confFile string, addr
 // Combined with aria2c's --interface (SO_BINDTODEVICE), this ensures downloads
 // go through the VPN tunnel while WireGuard's encrypted packets reach the endpoint.
 func setupRouting(ctx context.Context, iface string, localIP string, allowedIPs []string, tableID, fwmark int) error {
-	if runtime.GOOS != "linux" {
-		return nil
+	switch runtime.GOOS {
+	case "darwin":
+		return setupRoutingDarwin(ctx, iface, localIP, allowedIPs)
+	case "linux":
+		return setupRoutingLinux(ctx, iface, localIP, allowedIPs, tableID, fwmark)
 	}
+	return nil
+}
 
+// setupRoutingDarwin on macOS is a no-op: aria2c uses --interface=<utunX> which
+// sets IP_BOUND_IF to force traffic through the WireGuard interface regardless
+// of the routing table. No explicit routes needed.
+func setupRoutingDarwin(ctx context.Context, iface string, localIP string, allowedIPs []string) error {
+	return nil
+}
+
+// setupRoutingLinux uses fwmark + ip rule + ip route for policy routing.
+func setupRoutingLinux(ctx context.Context, iface string, localIP string, allowedIPs []string, tableID, fwmark int) error {
 	tStr := fmt.Sprintf("%d", tableID)
 	fStr := fmt.Sprintf("%d", fwmark)
 
@@ -570,7 +598,6 @@ func setupRouting(ctx context.Context, iface string, localIP string, allowedIPs 
 	// Add routes in custom table for AllowedIPs through the WireGuard interface
 	for _, cidr := range allowedIPs {
 		if cidr == "0.0.0.0/0" {
-			// Default route through the WireGuard interface
 			routeCmd := sudoCmd(ctx, "ip", "route", "add", "default", "dev", iface, "table", tStr)
 			if out, err := routeCmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("ip route add default: %s: %w", strings.TrimSpace(string(out)), err)
@@ -584,7 +611,6 @@ func setupRouting(ctx context.Context, iface string, localIP string, allowedIPs 
 	}
 
 	// Rule: traffic from the WireGuard interface's IP uses our custom table
-	// (unless it's already marked as WireGuard's own encrypted traffic)
 	if localIP != "" {
 		ruleCmd := sudoCmd(ctx, "ip", "rule", "add", "from", localIP, "not", "fwmark", fStr, "table", tStr)
 		if out, err := ruleCmd.CombinedOutput(); err != nil {
@@ -595,34 +621,33 @@ func setupRouting(ctx context.Context, iface string, localIP string, allowedIPs 
 	return nil
 }
 
-// cleanupRouting removes policy routing rules for a tunnel.
-func cleanupRouting(tableID, fwmark int) {
-	if runtime.GOOS != "linux" {
-		return
+// cleanupRouting removes routing rules for a tunnel.
+func cleanupRouting(iface string, tableID, fwmark int) {
+	switch runtime.GOOS {
+	case "darwin":
+		// Remove split-default routes (best effort)
+		sudoCmdNoCtx("route", "delete", "-net", "0.0.0.0/1", "-interface", iface).Run()
+		sudoCmdNoCtx("route", "delete", "-net", "128.0.0.0/1", "-interface", iface).Run()
+	case "linux":
+		tStr := fmt.Sprintf("%d", tableID)
+		sudoCmdNoCtx("ip", "rule", "del", "table", tStr).Run()
+		sudoCmdNoCtx("ip", "route", "flush", "table", tStr).Run()
 	}
-	tStr := fmt.Sprintf("%d", tableID)
-	fStr := fmt.Sprintf("%d", fwmark)
-	// Remove the ip rule (best effort, may already be gone)
-	sudoCmdNoCtx("ip", "rule", "del", "table", tStr).Run()
-	_ = fStr // fwmark used in rule matching but del by table is sufficient
-	// Flush the routing table
-	sudoCmdNoCtx("ip", "route", "flush", "table", tStr).Run()
 }
 
-// startAria2c launches an aria2c process bound to the given source IP.
-// We use the IP address rather than the interface name because --interface=<name>
-// requires CAP_NET_RAW for SO_BINDTODEVICE. Using an IP uses bind() instead,
-// and our policy routing rules handle routing traffic through the correct interface.
-func startAria2c(ctx context.Context, sourceIP string, port int, downloadDir string) (*exec.Cmd, string, error) {
+// startAria2c launches an aria2c process that routes through a SOCKS proxy.
+// The SOCKS proxy handles interface binding via IP_BOUND_IF/SO_BINDTODEVICE,
+// which is more reliable than aria2c's --interface (which only uses bind()).
+func startAria2c(ctx context.Context, socksPort int, rpcPort int, downloadDir string) (*exec.Cmd, string, error) {
 	args := []string{
 		"--enable-rpc=true",
 		"--rpc-listen-all=false",
-		fmt.Sprintf("--rpc-listen-port=%d", port),
+		fmt.Sprintf("--rpc-listen-port=%d", rpcPort),
 		"--rpc-allow-origin-all=true",
 		"--disable-ipv6=true",
-		fmt.Sprintf("--rpc-secret=%s", rpcSecret(port)),
+		fmt.Sprintf("--rpc-secret=%s", rpcSecret(rpcPort)),
 		fmt.Sprintf("--dir=%s", downloadDir),
-		fmt.Sprintf("--interface=%s", sourceIP),
+		fmt.Sprintf("--all-proxy=socks5://127.0.0.1:%d", socksPort),
 		fmt.Sprintf("--file-allocation=%s", fileAllocMethod()),
 		"--continue=true",
 		"--max-connection-per-server=4",
