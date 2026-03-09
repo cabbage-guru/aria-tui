@@ -78,11 +78,6 @@ func installHint(missing []string) string {
 
 // StartTunnel creates a WireGuard interface, configures it, and starts aria2c bound to it.
 func (m *Manager) StartTunnel(ctx context.Context, name string, wgConfigContents string) (*Tunnel, error) {
-	// WireGuard tunnel creation requires root (TUN device + /var/run/wireguard)
-	if os.Geteuid() != 0 {
-		return nil, fmt.Errorf("tunnel requires root privileges. Run with: sudo %s", os.Args[0])
-	}
-
 	m.mu.Lock()
 	port := m.nextPort
 	m.nextPort++
@@ -117,11 +112,19 @@ func (m *Manager) StartTunnel(ctx context.Context, name string, wgConfigContents
 		return nil, fmt.Errorf("starting wireguard-go: %w", err)
 	}
 
+	killWg := func() {
+		if wgCmd.Process != nil {
+			if needsSudo() {
+				sudoCmdNoCtx("kill", fmt.Sprintf("%d", wgCmd.Process.Pid)).Run()
+			} else {
+				wgCmd.Process.Kill()
+			}
+		}
+	}
+
 	// Configure the interface with wg setconf
 	if err := configureInterface(tunnelCtx, actualIface, confFile, address); err != nil {
-		if wgCmd.Process != nil {
-			wgCmd.Process.Kill()
-		}
+		killWg()
 		cancel()
 		removeInterface(actualIface)
 		os.Remove(confFile)
@@ -132,9 +135,7 @@ func (m *Manager) StartTunnel(ctx context.Context, name string, wgConfigContents
 	// Start aria2c bound to this interface
 	aria2Cmd, err := startAria2c(tunnelCtx, actualIface, port, m.downloadDir)
 	if err != nil {
-		if wgCmd.Process != nil {
-			wgCmd.Process.Kill()
-		}
+		killWg()
 		cancel()
 		removeInterface(actualIface)
 		return nil, fmt.Errorf("starting aria2c: %w", err)
@@ -184,9 +185,14 @@ func stopTunnel(t *Tunnel) error {
 		t.Aria2Cmd.Wait()
 	}
 
-	// Kill wireguard-go
+	// Kill wireguard-go (may be running as root via sudo)
 	if t.WGCmd != nil && t.WGCmd.Process != nil {
-		t.WGCmd.Process.Kill()
+		if needsSudo() {
+			// sudo process: use sudo kill since we don't own it
+			sudoCmdNoCtx("kill", fmt.Sprintf("%d", t.WGCmd.Process.Pid)).Run()
+		} else {
+			t.WGCmd.Process.Kill()
+		}
 		t.WGCmd.Wait()
 	}
 
@@ -248,6 +254,27 @@ func (m *Manager) generateIfaceName(name string) string {
 	return iface
 }
 
+// needsSudo returns true if the current process is not running as root.
+func needsSudo() bool {
+	return os.Geteuid() != 0
+}
+
+// sudoCmd wraps a command with sudo if not already root.
+func sudoCmd(ctx context.Context, name string, args ...string) *exec.Cmd {
+	if needsSudo() {
+		return exec.CommandContext(ctx, "sudo", append([]string{"-n", name}, args...)...)
+	}
+	return exec.CommandContext(ctx, name, args...)
+}
+
+// sudoCmdNoCtx wraps a command with sudo if not already root (no context).
+func sudoCmdNoCtx(name string, args ...string) *exec.Cmd {
+	if needsSudo() {
+		return exec.Command("sudo", append([]string{"-n", name}, args...)...)
+	}
+	return exec.Command(name, args...)
+}
+
 func sanitize(s string) string {
 	result := strings.Map(func(r rune) rune {
 		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
@@ -266,7 +293,10 @@ func sanitize(s string) string {
 func startWireGuardGo(ctx context.Context, ifaceName string) (*exec.Cmd, string, error) {
 	// Ensure the UAPI socket directory exists — wireguard-go won't create it
 	if err := os.MkdirAll("/var/run/wireguard", 0755); err != nil {
-		return nil, "", fmt.Errorf("creating /var/run/wireguard: %w (try running with sudo)", err)
+		// Try with sudo
+		if out, sudoErr := sudoCmdNoCtx("mkdir", "-p", "/var/run/wireguard").CombinedOutput(); sudoErr != nil {
+			return nil, "", fmt.Errorf("creating /var/run/wireguard: %w (sudo: %s)", err, strings.TrimSpace(string(out)))
+		}
 	}
 
 	// Write output to a temp log file so we can read it while the process runs
@@ -277,7 +307,7 @@ func startWireGuardGo(ctx context.Context, ifaceName string) (*exec.Cmd, string,
 	}
 	logPath := logFile.Name()
 
-	cmd := exec.CommandContext(ctx, "wireguard-go", ifaceName)
+	cmd := sudoCmd(ctx, "wireguard-go", ifaceName)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
@@ -382,10 +412,14 @@ func startWireGuardGo(ctx context.Context, ifaceName string) (*exec.Cmd, string,
 		sockDir = fmt.Sprintf(" (dir error: %v)", dirErr)
 	}
 
-	cmd.Process.Kill()
+	if needsSudo() {
+		sudoCmdNoCtx("kill", fmt.Sprintf("%d", cmd.Process.Pid)).Run()
+	} else {
+		cmd.Process.Kill()
+	}
 	cmd.Wait()
 
-	return nil, "", fmt.Errorf("wireguard-go started but UAPI socket never appeared\nExpected: /var/run/wireguard/%s.sock%s\nInterface: %s\nOutput: %s\n\nHint: wireguard-go needs root. Try: sudo ./aria-tui", actualIface, sockDir, actualIface, output)
+	return nil, "", fmt.Errorf("wireguard-go started but UAPI socket never appeared\nExpected: /var/run/wireguard/%s.sock%s\nInterface: %s\nOutput: %s\n\nHint: ensure your user has passwordless sudo for wireguard-go, wg, ifconfig/ip", actualIface, sockDir, actualIface, output)
 }
 
 // configureInterface sets up the WireGuard interface with wg and assigns IP.
@@ -393,7 +427,7 @@ func configureInterface(ctx context.Context, iface string, confFile string, addr
 	// Apply WireGuard configuration, retrying since wireguard-go may still be initializing
 	var lastErr error
 	for attempt := 0; attempt < 10; attempt++ {
-		cmd := exec.CommandContext(ctx, "wg", "setconf", iface, confFile)
+		cmd := sudoCmd(ctx, "wg", "setconf", iface, confFile)
 		out, err := cmd.CombinedOutput()
 		if err == nil {
 			lastErr = nil
@@ -421,32 +455,32 @@ func configureInterface(ctx context.Context, iface string, confFile string, addr
 	switch runtime.GOOS {
 	case "darwin":
 		// macOS: ifconfig utunX inet <ip> <ip> (point-to-point)
-		ifCmd := exec.CommandContext(ctx, "ifconfig", iface, "inet", ip.String(), ip.String())
+		ifCmd := sudoCmd(ctx, "ifconfig", iface, "inet", ip.String(), ip.String())
 		if out, err := ifCmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("ifconfig: %s: %w", strings.TrimSpace(string(out)), err)
 		}
 
 		// Set MTU
-		mtuCmd := exec.CommandContext(ctx, "ifconfig", iface, "mtu", "1420")
+		mtuCmd := sudoCmd(ctx, "ifconfig", iface, "mtu", "1420")
 		mtuCmd.Run() // best effort
 
 	case "linux":
 		// Linux: ip addr add <cidr> dev <iface>
 		ones, _ := ipNet.Mask.Size()
 		cidr := fmt.Sprintf("%s/%d", ip.String(), ones)
-		addrCmd := exec.CommandContext(ctx, "ip", "addr", "add", cidr, "dev", iface)
+		addrCmd := sudoCmd(ctx, "ip", "addr", "add", cidr, "dev", iface)
 		if out, err := addrCmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("ip addr add: %s: %w", strings.TrimSpace(string(out)), err)
 		}
 
 		// Bring interface up
-		upCmd := exec.CommandContext(ctx, "ip", "link", "set", iface, "up")
+		upCmd := sudoCmd(ctx, "ip", "link", "set", iface, "up")
 		if out, err := upCmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("ip link set up: %s: %w", strings.TrimSpace(string(out)), err)
 		}
 
 		// Set MTU
-		mtuCmd := exec.CommandContext(ctx, "ip", "link", "set", iface, "mtu", "1420")
+		mtuCmd := sudoCmd(ctx, "ip", "link", "set", iface, "mtu", "1420")
 		mtuCmd.Run() // best effort
 	}
 
@@ -498,9 +532,9 @@ func removeInterface(iface string) {
 	case "darwin":
 		// On macOS, killing wireguard-go removes the utun
 		// But we can also try to bring it down
-		exec.Command("ifconfig", iface, "down").Run()
+		sudoCmdNoCtx("ifconfig", iface, "down").Run()
 	case "linux":
-		exec.Command("ip", "link", "delete", iface).Run()
+		sudoCmdNoCtx("ip", "link", "delete", iface).Run()
 	}
 }
 
