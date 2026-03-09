@@ -578,10 +578,31 @@ func setupRouting(ctx context.Context, iface string, localIP string, allowedIPs 
 	return nil
 }
 
-// setupRoutingDarwin on macOS is a no-op: aria2c uses --interface=<utunX> which
-// sets IP_BOUND_IF to force traffic through the WireGuard interface regardless
-// of the routing table. No explicit routes needed.
+// setupRoutingDarwin adds interface-scoped routes on macOS.
+// IP_BOUND_IF sets the source IP but macOS still needs routes to know HOW to
+// reach destinations through utun interfaces. Using -ifscope makes the routes
+// only apply to sockets bound to that specific interface, so multiple tunnels
+// don't conflict with each other or the default route.
 func setupRoutingDarwin(ctx context.Context, iface string, localIP string, allowedIPs []string) error {
+	for _, cidr := range allowedIPs {
+		if cidr == "0.0.0.0/0" {
+			// Split-default with -ifscope: only applies to sockets bound to this interface
+			for _, half := range []string{"0.0.0.0/1", "128.0.0.0/1"} {
+				routeCmd := sudoCmd(ctx, "route", "add", "-ifscope", iface, "-net", half, "-interface", iface)
+				if out, err := routeCmd.CombinedOutput(); err != nil {
+					return fmt.Errorf("route add -ifscope %s %s: %s: %w", iface, half, strings.TrimSpace(string(out)), err)
+				}
+			}
+		} else if cidr == "::/0" {
+			// Skip IPv6 for now
+			continue
+		} else {
+			routeCmd := sudoCmd(ctx, "route", "add", "-ifscope", iface, "-net", cidr, "-interface", iface)
+			if out, err := routeCmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("route add -ifscope %s %s: %s: %w", iface, cidr, strings.TrimSpace(string(out)), err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -626,9 +647,9 @@ func setupRoutingLinux(ctx context.Context, iface string, localIP string, allowe
 func cleanupRouting(iface string, tableID, fwmark int) {
 	switch runtime.GOOS {
 	case "darwin":
-		// Remove split-default routes (best effort)
-		sudoCmdNoCtx("route", "delete", "-net", "0.0.0.0/1", "-interface", iface).Run()
-		sudoCmdNoCtx("route", "delete", "-net", "128.0.0.0/1", "-interface", iface).Run()
+		// Remove scoped split-default routes (best effort)
+		sudoCmdNoCtx("route", "delete", "-ifscope", iface, "-net", "0.0.0.0/1", "-interface", iface).Run()
+		sudoCmdNoCtx("route", "delete", "-ifscope", iface, "-net", "128.0.0.0/1", "-interface", iface).Run()
 	case "linux":
 		tStr := fmt.Sprintf("%d", tableID)
 		sudoCmdNoCtx("ip", "rule", "del", "table", tStr).Run()
