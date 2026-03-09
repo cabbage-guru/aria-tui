@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -259,9 +260,12 @@ func sanitize(s string) string {
 // startWireGuardGo launches wireguard-go for the given interface name.
 // On macOS, wireguard-go auto-assigns a utun interface.
 func startWireGuardGo(ctx context.Context, ifaceName string) (*exec.Cmd, string, error) {
+	// Ensure the UAPI socket directory exists — wireguard-go won't create it
+	os.MkdirAll("/var/run/wireguard", 0755)
+
 	cmd := exec.CommandContext(ctx, "wireguard-go", ifaceName)
 
-	// Capture stderr to parse the actual interface name
+	// Capture stderr to parse the actual interface name and errors
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		return nil, "", err
@@ -269,14 +273,17 @@ func startWireGuardGo(ctx context.Context, ifaceName string) (*exec.Cmd, string,
 
 	// WG_TUN_NAME_FILE: wireguard-go writes the actual interface name here
 	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("wg-tun-%s-%d", ifaceName, time.Now().UnixNano()))
-	cmd.Env = append(os.Environ(), fmt.Sprintf("WG_TUN_NAME_FILE=%s", tmpFile))
+	cmd.Env = append(os.Environ(),
+		fmt.Sprintf("WG_TUN_NAME_FILE=%s", tmpFile),
+		"LOG_LEVEL=debug",
+	)
 
 	if err := cmd.Start(); err != nil {
 		return nil, "", fmt.Errorf("failed to start wireguard-go: %w", err)
 	}
 
-	// Read stderr in a goroutine to avoid blocking
-	stderrLines := make(chan string, 10)
+	// Collect stderr in a goroutine
+	stderrLines := make(chan string, 50)
 	go func() {
 		scanner := bufio.NewScanner(stderrPipe)
 		for scanner.Scan() {
@@ -285,58 +292,102 @@ func startWireGuardGo(ctx context.Context, ifaceName string) (*exec.Cmd, string,
 		close(stderrLines)
 	}()
 
+	// Channel to detect early exit — we check via /proc on Linux
+	// or by seeing if the process is still alive
+	processAlive := func() bool {
+		if cmd.Process == nil {
+			return false
+		}
+		// Sending signal 0 checks if process exists without actually signaling
+		return cmd.Process.Signal(syscall.Signal(0)) == nil
+	}
+
 	actualIface := ifaceName
+	var stderrCollected []string
 
 	// Wait for wireguard-go to create the interface (up to 5 seconds)
 	for i := 0; i < 50; i++ {
+		// Check if wireguard-go died
+		if !processAlive() {
+			// Give stderr a moment to flush
+			time.Sleep(100 * time.Millisecond)
+			for {
+				select {
+				case line, ok := <-stderrLines:
+					if !ok {
+						goto drained
+					}
+					stderrCollected = append(stderrCollected, line)
+				default:
+					goto drained
+				}
+			}
+		drained:
+			os.Remove(tmpFile)
+			detail := strings.Join(stderrCollected, "\n")
+			if detail == "" {
+				detail = "no output"
+			}
+			return nil, "", fmt.Errorf("wireguard-go exited immediately (is this running as root/sudo?)\nOutput: %s", detail)
+		}
+
 		time.Sleep(100 * time.Millisecond)
 
-		// Check WG_TUN_NAME_FILE first (most reliable)
-		if data, err := os.ReadFile(tmpFile); err == nil {
+		// Drain stderr lines
+	drainLoop:
+		for {
+			select {
+			case line, ok := <-stderrLines:
+				if !ok {
+					break drainLoop
+				}
+				stderrCollected = append(stderrCollected, line)
+				// Parse interface name from output like "INFO: (utun3) ..."
+				if idx := strings.Index(line, "("); idx >= 0 {
+					if end := strings.Index(line[idx:], ")"); end >= 0 {
+						actualIface = line[idx+1 : idx+end]
+					}
+				}
+			default:
+				break drainLoop
+			}
+		}
+
+		// Check WG_TUN_NAME_FILE (most reliable)
+		if data, readErr := os.ReadFile(tmpFile); readErr == nil {
 			actual := strings.TrimSpace(string(data))
 			if actual != "" {
 				actualIface = actual
 				os.Remove(tmpFile)
-				break
 			}
-		}
-
-		// Also check stderr output for interface name
-		select {
-		case line := <-stderrLines:
-			// wireguard-go prints "INFO: (utun3) ..." or similar
-			if idx := strings.Index(line, "("); idx >= 0 {
-				if end := strings.Index(line[idx:], ")"); end >= 0 {
-					actualIface = line[idx+1 : idx+end]
-				}
-			}
-		default:
 		}
 
 		// Check if the UAPI socket exists (means wireguard-go is ready)
 		socketPath := fmt.Sprintf("/var/run/wireguard/%s.sock", actualIface)
-		if runtime.GOOS == "darwin" {
-			socketPath = fmt.Sprintf("/var/run/wireguard/%s.sock", actualIface)
-		}
-		if _, err := os.Stat(socketPath); err == nil {
+		if _, statErr := os.Stat(socketPath); statErr == nil {
 			break
 		}
 	}
 
-	os.Remove(tmpFile) // clean up in case we broke out via socket check
+	os.Remove(tmpFile)
 
 	// Final verification: make sure the UAPI socket is there
 	socketPath := fmt.Sprintf("/var/run/wireguard/%s.sock", actualIface)
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 20; i++ {
 		if _, err := os.Stat(socketPath); err == nil {
 			return cmd, actualIface, nil
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(250 * time.Millisecond)
 	}
 
-	// Even if socket isn't found, return what we have — wg setconf will
-	// retry below anyway
-	return cmd, actualIface, nil
+	// Socket never appeared — something is wrong
+	detail := strings.Join(stderrCollected, "\n")
+	if detail == "" {
+		detail = "no output"
+	}
+	// Kill the process since it's not working
+	cmd.Process.Kill()
+	return nil, "", fmt.Errorf("wireguard-go started but UAPI socket never appeared at %s\nInterface: %s\nOutput: %s", socketPath, actualIface, detail)
 }
 
 // configureInterface sets up the WireGuard interface with wg and assigns IP.
