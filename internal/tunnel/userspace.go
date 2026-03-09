@@ -52,7 +52,7 @@ func NewUserspaceWG(config string) (*UserspaceWG, error) {
 	log.Printf("[wg-userspace] creating WireGuard device")
 
 	// Create WireGuard device
-	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(device.LogLevelVerbose, "wg: "))
+	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(device.LogLevelError, "wg: "))
 
 	// Convert .conf to IPC format and apply
 	ipcConf, err := confToIPC(config)

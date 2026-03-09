@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -197,7 +198,7 @@ func (m *Manager) IsRunning(name string) bool {
 	// Check if aria2c is still running
 	if t.Aria2Cmd != nil && t.Aria2Cmd.Process != nil {
 		// On Unix, sending signal 0 checks if process exists
-		err := t.Aria2Cmd.Process.Signal(os.Signal(nil))
+		err := t.Aria2Cmd.Process.Signal(syscall.Signal(0))
 		return err == nil
 	}
 	return false
@@ -262,7 +263,7 @@ func startAria2c(ctx context.Context, proxyPort int, rpcPort int, downloadDir st
 	time.Sleep(1 * time.Second)
 
 	if cmd.Process != nil {
-		if err := cmd.Process.Signal(os.Signal(nil)); err != nil {
+		if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
 			// Process already exited
 			cmd.Wait()
 			logData, _ := os.ReadFile(logPath)
