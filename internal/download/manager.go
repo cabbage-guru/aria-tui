@@ -3,7 +3,9 @@ package download
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -346,11 +348,20 @@ func (m *Manager) processQueue() {
 	}
 
 	if !ready {
+		// Read aria2c log for diagnostics
+		errMsg := "aria2c RPC not ready after 15s"
+		if tun.Aria2Log != "" {
+			if logData, err := os.ReadFile(tun.Aria2Log); err == nil {
+				if out := strings.TrimSpace(string(logData)); out != "" {
+					errMsg += "\naria2c output: " + out
+				}
+			}
+		}
 		m.vpnPool.Release(wgCfg.Name)
 		m.tunnelMgr.StopTunnel(m.ctx, wgCfg.Name)
 		m.mu.Lock()
 		dl.Status = StatusError
-		dl.Error = "aria2c RPC not ready after 15s"
+		dl.Error = errMsg
 		m.mu.Unlock()
 		m.recordHistory(dl)
 		return

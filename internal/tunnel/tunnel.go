@@ -21,6 +21,7 @@ type Tunnel struct {
 	VPNConfig string
 	RPCPort   int
 	Aria2Cmd  *exec.Cmd
+	Aria2Log  string // path to aria2c log file for debugging
 	WGCmd     *exec.Cmd // wireguard-go process
 	Created   time.Time
 	cancel    context.CancelFunc
@@ -133,7 +134,7 @@ func (m *Manager) StartTunnel(ctx context.Context, name string, wgConfigContents
 	os.Remove(confFile) // no longer needed
 
 	// Start aria2c bound to this interface
-	aria2Cmd, err := startAria2c(tunnelCtx, actualIface, port, m.downloadDir)
+	aria2Cmd, aria2LogPath, err := startAria2c(tunnelCtx, actualIface, port, m.downloadDir)
 	if err != nil {
 		killWg()
 		cancel()
@@ -147,6 +148,7 @@ func (m *Manager) StartTunnel(ctx context.Context, name string, wgConfigContents
 		VPNConfig: name,
 		RPCPort:   port,
 		Aria2Cmd:  aria2Cmd,
+		Aria2Log:  aria2LogPath,
 		WGCmd:     wgCmd,
 		Created:   time.Now(),
 		cancel:    cancel,
@@ -198,6 +200,11 @@ func stopTunnel(t *Tunnel) error {
 
 	// Remove the interface
 	removeInterface(t.Interface)
+
+	// Clean up aria2c log
+	if t.Aria2Log != "" {
+		os.Remove(t.Aria2Log)
+	}
 	return nil
 }
 
@@ -488,7 +495,7 @@ func configureInterface(ctx context.Context, iface string, confFile string, addr
 }
 
 // startAria2c launches an aria2c process bound to the given interface.
-func startAria2c(ctx context.Context, iface string, port int, downloadDir string) (*exec.Cmd, error) {
+func startAria2c(ctx context.Context, iface string, port int, downloadDir string) (*exec.Cmd, string, error) {
 	args := []string{
 		"--enable-rpc=true",
 		"--rpc-listen-all=true",
@@ -496,7 +503,7 @@ func startAria2c(ctx context.Context, iface string, port int, downloadDir string
 		"--rpc-allow-origin-all=true",
 		fmt.Sprintf("--dir=%s", downloadDir),
 		fmt.Sprintf("--interface=%s", iface),
-		"--file-allocation=falloc",
+		fmt.Sprintf("--file-allocation=%s", fileAllocMethod()),
 		"--continue=true",
 		"--max-connection-per-server=4",
 		"--min-split-size=1M",
@@ -512,18 +519,50 @@ func startAria2c(ctx context.Context, iface string, port int, downloadDir string
 		"--console-log-level=warn",
 	}
 
+	// Log aria2c output for debugging
+	aria2Log, err := os.CreateTemp("", "aria2c-*.log")
+	if err != nil {
+		return nil, "", fmt.Errorf("creating aria2c log: %w", err)
+	}
+	logPath := aria2Log.Name()
+
 	cmd := exec.CommandContext(ctx, "aria2c", args...)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
+	cmd.Stdout = aria2Log
+	cmd.Stderr = aria2Log
 
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("failed to start aria2c: %w", err)
+		aria2Log.Close()
+		os.Remove(logPath)
+		return nil, "", fmt.Errorf("failed to start aria2c: %w", err)
 	}
 
-	// Wait a bit for aria2c to start listening
-	time.Sleep(500 * time.Millisecond)
+	// Wait a bit and verify aria2c is still running
+	time.Sleep(1 * time.Second)
 
-	return cmd, nil
+	if cmd.Process != nil {
+		if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+			// Process already exited
+			cmd.Wait()
+			logData, _ := os.ReadFile(logPath)
+			aria2Log.Close()
+			output := strings.TrimSpace(string(logData))
+			if output == "" {
+				output = "no output"
+			}
+			return nil, "", fmt.Errorf("aria2c exited immediately\nOutput: %s", output)
+		}
+	}
+
+	aria2Log.Close()
+
+	return cmd, logPath, nil
+}
+
+func fileAllocMethod() string {
+	if runtime.GOOS == "darwin" {
+		return "none" // macOS doesn't support fallocate
+	}
+	return "falloc"
 }
 
 // removeInterface removes a network interface.
