@@ -55,6 +55,9 @@ type Model struct {
 	message   string
 	messageAt time.Time
 
+	// History scroll state
+	historyOffset int
+
 	// VPN config add state
 	vpnAddName  string
 	vpnAddPhase int // 0 = name, 1 = content
@@ -136,38 +139,50 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "tab", "right", "l":
 		m.activeTab = (m.activeTab + 1) % 4
 		m.cursor = 0
+		m.historyOffset = 0
 		return m, nil
 
 	case "shift+tab", "left", "h":
 		m.activeTab = (m.activeTab - 1 + 4) % 4
 		m.cursor = 0
+		m.historyOffset = 0
 		return m, nil
 
 	case "up", "k":
+		if m.activeTab == tabHistory {
+			return m.handleHistoryKey(msg)
+		}
 		if m.cursor > 0 {
 			m.cursor--
 		}
 		return m, nil
 
 	case "down", "j":
+		if m.activeTab == tabHistory {
+			return m.handleHistoryKey(msg)
+		}
 		m.cursor++
 		return m, nil
 
 	case "1":
 		m.activeTab = tabDownloads
 		m.cursor = 0
+		m.historyOffset = 0
 		return m, nil
 	case "2":
 		m.activeTab = tabVPN
 		m.cursor = 0
+		m.historyOffset = 0
 		return m, nil
 	case "3":
 		m.activeTab = tabHistory
 		m.cursor = 0
+		m.historyOffset = 0
 		return m, nil
 	case "4":
 		m.activeTab = tabSettings
 		m.cursor = 0
+		m.historyOffset = 0
 		return m, nil
 	}
 
@@ -350,26 +365,68 @@ func (m Model) handleVPNKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m Model) handleHistoryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	entries := m.hist.All()
+	total := len(entries)
+
+	const windowSize = 10
+	const scrollThreshold = 7 // start scrolling when cursor reaches this position
 
 	switch msg.String() {
 	case "C":
 		m.hist.Clear()
 		m.cursor = 0
+		m.historyOffset = 0
 		m.setMessage("History cleared")
 		return m, nil
 
 	case "r":
-		if m.cursor < len(entries) {
-			e := entries[m.cursor]
+		absIdx := m.historyOffset + m.cursor
+		if absIdx < total {
+			e := entries[absIdx]
 			m.dlMgr.Add(e.URL)
 			m.setMessage(fmt.Sprintf("Re-queued: %s", e.URL))
 		}
 		return m, nil
+
+	case "down", "j":
+		absIdx := m.historyOffset + m.cursor
+		if absIdx < total-1 {
+			if m.cursor >= scrollThreshold {
+				// Scroll the window forward
+				m.historyOffset++
+			} else {
+				m.cursor++
+			}
+		}
+		return m, nil
+
+	case "up", "k":
+		if m.cursor > 0 {
+			m.cursor--
+		} else if m.historyOffset > 0 {
+			m.historyOffset--
+		}
+		return m, nil
 	}
 
-	// Clamp cursor
-	if m.cursor >= len(entries) && len(entries) > 0 {
-		m.cursor = len(entries) - 1
+	// Clamp
+	if total > 0 {
+		maxOffset := total - windowSize
+		if maxOffset < 0 {
+			maxOffset = 0
+		}
+		if m.historyOffset > maxOffset {
+			m.historyOffset = maxOffset
+		}
+		visible := total - m.historyOffset
+		if visible > windowSize {
+			visible = windowSize
+		}
+		if m.cursor >= visible {
+			m.cursor = visible - 1
+		}
+	} else {
+		m.cursor = 0
+		m.historyOffset = 0
 	}
 
 	return m, nil
@@ -701,15 +758,17 @@ func (m Model) renderHistory() string {
 	b.WriteString(fmt.Sprintf("  Total: %d  Completed: %d  Failed: %d\n\n",
 		len(entries), len(completed), len(failed)))
 
-	maxItems := 10
-	if maxItems > len(entries) {
-		maxItems = len(entries)
+	windowSize := 10
+	end := m.historyOffset + windowSize
+	if end > len(entries) {
+		end = len(entries)
 	}
 
-	for i := 0; i < maxItems; i++ {
+	for i := m.historyOffset; i < end; i++ {
 		e := entries[i]
+		visIdx := i - m.historyOffset
 		prefix := "  "
-		if i == m.cursor {
+		if visIdx == m.cursor {
 			prefix = "> "
 		}
 
@@ -742,7 +801,7 @@ func (m Model) renderHistory() string {
 		timeStr := e.StartedAt.Format("2006-01-02 15:04")
 		line := fmt.Sprintf("%s%s %s  %s  VPN: %s", prefix, statusStr, displayName, timeStr, e.VPNConfig)
 
-		if i == m.cursor {
+		if visIdx == m.cursor {
 			line = selectedStyle.Render(line)
 		}
 		b.WriteString(line + "\n")
@@ -752,8 +811,9 @@ func (m Model) renderHistory() string {
 		}
 	}
 
-	if len(entries) > maxItems {
-		b.WriteString(mutedStyle(fmt.Sprintf("\n  ... and %d older entries", len(entries)-maxItems)))
+	remaining := len(entries) - end
+	if remaining > 0 {
+		b.WriteString(mutedStyle(fmt.Sprintf("\n  ... and %d older entries", remaining)))
 	}
 
 	return b.String()
