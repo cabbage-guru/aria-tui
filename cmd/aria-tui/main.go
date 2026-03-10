@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -41,6 +43,9 @@ func main() {
 		case "check":
 			handleCheck()
 			return
+		case "cleanup":
+			handleCleanup()
+			return
 		case "test":
 			handleTest()
 			return
@@ -63,6 +68,7 @@ Usage:
   aria-tui import-dir <dir>    Import all .conf files from a directory
   aria-tui list-vpn            List all VPN configurations
   aria-tui check               Check that dependencies are installed
+  aria-tui cleanup             Kill orphaned aria2c processes and remove stale files
   aria-tui test                Test download through a VPN tunnel
 
 TUI Controls:
@@ -109,6 +115,70 @@ func handleClip() {
 		os.Exit(1)
 	}
 	fmt.Printf("Queued: %s\n", text)
+}
+
+func handleCleanup() {
+	fmt.Println("Cleaning up orphaned aria-tui resources...")
+
+	// 1. Kill orphaned aria2c processes spawned by aria-tui
+	killOrphanedAria2c()
+
+	// 2. Remove stale IPC socket
+	sockPath := config.SocketPath()
+	if _, err := os.Stat(sockPath); err == nil {
+		// Check if a TUI is actually listening
+		conn, err := net.DialTimeout("unix", sockPath, 500*time.Millisecond)
+		if err != nil {
+			// Nobody listening — stale socket
+			os.Remove(sockPath)
+			fmt.Printf("  Removed stale socket: %s\n", sockPath)
+		} else {
+			conn.Close()
+			fmt.Println("  Socket is active (TUI is running), skipping")
+		}
+	}
+
+	// 3. Remove orphaned aria2c temp log files
+	matches, _ := filepath.Glob(filepath.Join(os.TempDir(), "aria2c-*.log"))
+	for _, m := range matches {
+		os.Remove(m)
+		fmt.Printf("  Removed temp log: %s\n", m)
+	}
+
+	// 4. Clear stale queue file
+	queuePath := config.QueuePath()
+	if data, err := os.ReadFile(queuePath); err == nil && len(data) > 0 {
+		os.Remove(queuePath)
+		fmt.Printf("  Removed stale queue: %s\n", queuePath)
+	}
+
+	fmt.Println("Done.")
+}
+
+func killOrphanedAria2c() {
+	// Find aria2c processes with aria-tui RPC secret in their arguments
+	out, err := exec.Command("pgrep", "-f", "aria2c.*rpc-secret=aria-tui").Output()
+	if err != nil {
+		// No matching processes
+		return
+	}
+
+	pids := strings.Fields(strings.TrimSpace(string(out)))
+	for _, pidStr := range pids {
+		var pid int
+		if _, err := fmt.Sscanf(pidStr, "%d", &pid); err != nil {
+			continue
+		}
+		proc, err := os.FindProcess(pid)
+		if err != nil {
+			continue
+		}
+		if err := proc.Kill(); err != nil {
+			fmt.Printf("  Failed to kill aria2c PID %d: %v\n", pid, err)
+		} else {
+			fmt.Printf("  Killed orphaned aria2c PID %d\n", pid)
+		}
+	}
 }
 
 func handleCheck() {

@@ -72,6 +72,7 @@ type Download struct {
 	LastBytes     int64     // bytes at last progress check
 	StaleNotified bool
 	RateLimited   bool // true if this download hit a 429
+	Retries       int  // number of times this download was re-queued due to tunnel failures
 }
 
 func (d *Download) Progress() float64 {
@@ -226,26 +227,29 @@ func (m *Manager) ActiveCount() int {
 // Cancel cancels a download.
 func (m *Manager) Cancel(id string) {
 	m.mu.Lock()
+	var vpnName string
 	for _, d := range m.downloads {
 		if d.ID == id {
 			d.Status = StatusCancelled
-			go m.cleanupDownload(d)
+			vpnName = d.VPNConfig
+			d.VPNConfig = ""
 			break
 		}
 	}
 	m.mu.Unlock()
+	if vpnName != "" {
+		go m.cleanupTunnel(vpnName)
+	}
 	m.saveQueue()
 }
 
 // Restart restarts a stale or failed download.
 func (m *Manager) Restart(id string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
+	var vpnName string
 	for _, d := range m.downloads {
 		if d.ID == id && (d.Status == StatusStale || d.Status == StatusError) {
-			// Clean up old tunnel
-			go m.cleanupDownload(d)
+			vpnName = d.VPNConfig
 
 			d.Status = StatusQueued
 			d.Error = ""
@@ -261,16 +265,20 @@ func (m *Manager) Restart(id string) {
 			break
 		}
 	}
+	m.mu.Unlock()
+	if vpnName != "" {
+		go m.cleanupTunnel(vpnName)
+	}
 }
 
 // Remove removes a download from the list.
 func (m *Manager) Remove(id string) {
 	m.mu.Lock()
+	var vpnName string
 	for i, d := range m.downloads {
 		if d.ID == id {
-			if d.Status == StatusStarting || d.Status == StatusDownloading {
-				go m.cleanupDownload(d)
-			}
+			vpnName = d.VPNConfig
+			d.VPNConfig = ""
 			m.downloads = append(m.downloads[:i], m.downloads[i+1:]...)
 			break
 		}
@@ -284,6 +292,9 @@ func (m *Manager) Remove(id string) {
 		}
 	}
 	m.mu.Unlock()
+	if vpnName != "" {
+		go m.cleanupTunnel(vpnName)
+	}
 	m.saveQueue()
 }
 
@@ -356,10 +367,18 @@ func (m *Manager) processQueue() {
 	if err != nil {
 		m.vpnPool.Release(wgCfg.Name)
 		m.mu.Lock()
-		dl.Status = StatusError
-		dl.Error = fmt.Sprintf("Tunnel start failed: %v", err)
-		m.mu.Unlock()
-		m.recordHistory(dl)
+		dl.Retries++
+		if dl.Retries >= 5 {
+			dl.Status = StatusError
+			dl.Error = fmt.Sprintf("Tunnel start failed after %d retries: %v", dl.Retries, err)
+			m.mu.Unlock()
+			m.recordHistory(dl)
+		} else {
+			dl.Status = StatusQueued
+			dl.Error = fmt.Sprintf("Tunnel start failed (retry %d/5): %v", dl.Retries, err)
+			m.queue = append(m.queue, dl.ID)
+			m.mu.Unlock()
+		}
 		return
 	}
 
@@ -398,10 +417,18 @@ func (m *Manager) processQueue() {
 		m.vpnPool.Release(wgCfg.Name)
 		m.tunnelMgr.StopTunnel(m.ctx, wgCfg.Name)
 		m.mu.Lock()
-		dl.Status = StatusError
-		dl.Error = errMsg
-		m.mu.Unlock()
-		m.recordHistory(dl)
+		dl.Retries++
+		if dl.Retries >= 5 {
+			dl.Status = StatusError
+			dl.Error = fmt.Sprintf("%s (failed after %d retries)", errMsg, dl.Retries)
+			m.mu.Unlock()
+			m.recordHistory(dl)
+		} else {
+			dl.Status = StatusQueued
+			dl.Error = fmt.Sprintf("%s (retry %d/5)", errMsg, dl.Retries)
+			m.queue = append(m.queue, dl.ID)
+			m.mu.Unlock()
+		}
 		return
 	}
 
@@ -422,6 +449,8 @@ func (m *Manager) processQueue() {
 	dl.GID = gid
 	dl.Status = StatusDownloading
 	dl.LastProgress = time.Now()
+	dl.Retries = 0
+	dl.Error = ""
 	m.mu.Unlock()
 }
 
@@ -483,8 +512,10 @@ func (m *Manager) updateStatuses() {
 		case "complete":
 			dl.Status = StatusComplete
 			dl.CompletedAt = time.Now()
-			go m.cleanupDownload(dl)
+			vpnName := dl.VPNConfig
+			dl.VPNConfig = ""
 			m.mu.Unlock()
+			go m.cleanupTunnel(vpnName)
 			m.recordHistory(dl)
 			continue
 
@@ -492,13 +523,12 @@ func (m *Manager) updateStatuses() {
 			// Detect 429 rate limiting: cooldown the VPN and retry on a different one
 			if isRateLimited(status.ErrorCode, status.ErrorMessage) {
 				dl.RateLimited = true
-				rateLimitedVPN := dl.VPNConfig
-				m.vpnPool.SetCooldown(rateLimitedVPN, cooldownDuration)
-				go m.cleanupDownload(dl)
+				vpnName := dl.VPNConfig
+				m.vpnPool.SetCooldown(vpnName, cooldownDuration)
 
 				// Re-queue for retry on a different VPN
 				dl.Status = StatusQueued
-				dl.Error = fmt.Sprintf("Rate limited (429) on %s - retrying on different VPN", rateLimitedVPN)
+				dl.Error = fmt.Sprintf("Rate limited (429) on %s - retrying on different VPN", vpnName)
 				dl.GID = ""
 				dl.RPCPort = 0
 				dl.VPNConfig = ""
@@ -508,13 +538,16 @@ func (m *Manager) updateStatuses() {
 				dl.LastBytes = 0
 				m.queue = append(m.queue, dl.ID)
 				m.mu.Unlock()
+				go m.cleanupTunnel(vpnName)
 				continue
 			}
 
 			dl.Status = StatusError
 			dl.Error = fmt.Sprintf("aria2 error %s: %s", status.ErrorCode, status.ErrorMessage)
-			go m.cleanupDownload(dl)
+			vpnName := dl.VPNConfig
+			dl.VPNConfig = ""
 			m.mu.Unlock()
+			go m.cleanupTunnel(vpnName)
 			m.recordHistory(dl)
 			continue
 
@@ -535,11 +568,14 @@ func (m *Manager) updateStatuses() {
 	}
 }
 
-func (m *Manager) cleanupDownload(dl *Download) {
-	if dl.VPNConfig != "" {
-		m.tunnelMgr.StopTunnel(context.Background(), dl.VPNConfig)
-		m.vpnPool.Release(dl.VPNConfig)
+// cleanupTunnel tears down the tunnel and releases the VPN config back to the pool.
+// The vpnName must be captured by the caller before clearing dl.VPNConfig to avoid races.
+func (m *Manager) cleanupTunnel(vpnName string) {
+	if vpnName == "" {
+		return
 	}
+	m.tunnelMgr.StopTunnel(context.Background(), vpnName)
+	m.vpnPool.Release(vpnName)
 }
 
 // saveQueue persists all queued/active URLs to disk so they survive restarts.
