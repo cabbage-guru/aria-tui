@@ -64,6 +64,7 @@ TUI Controls:
   Tab/Arrow    Navigate tabs and items
   j/k          Move cursor up/down
   a            Add (URL in Downloads tab, VPN config in VPN tab)
+  Ctrl+V       Paste URL from clipboard and queue download (any tab)
   i            Import VPN config from file path (VPN tab)
   r            Restart stale/failed download
   c            Cancel active download

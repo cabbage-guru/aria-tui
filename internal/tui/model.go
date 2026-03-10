@@ -2,9 +2,11 @@ package tui
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -135,6 +137,28 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c":
 		m.dlMgr.Stop()
 		return m, tea.Quit
+
+	case "ctrl+v":
+		// Paste URL from clipboard and queue download
+		text, err := clipboard.ReadAll()
+		if err != nil {
+			m.setMessage("Error reading clipboard")
+			return m, nil
+		}
+		text = strings.TrimSpace(text)
+		if text == "" {
+			m.setMessage("Clipboard is empty")
+			return m, nil
+		}
+		u, err := url.Parse(text)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+			m.setMessage("Clipboard does not contain a valid URL")
+			return m, nil
+		}
+		m.dlMgr.Add(text)
+		m.activeTab = tabDownloads
+		m.setMessage(fmt.Sprintf("Queued from clipboard: %s", text))
+		return m, nil
 
 	case "tab", "right", "l":
 		m.activeTab = (m.activeTab + 1) % 4
@@ -860,7 +884,7 @@ func (m Model) renderHelp() string {
 	var help string
 	switch m.activeTab {
 	case tabDownloads:
-		help = "a:add  r:restart  c:cancel  d:remove  1-4:tabs  q:quit"
+		help = "a:add  ctrl+v:paste URL  r:restart  c:cancel  d:remove  1-4:tabs  q:quit"
 	case tabVPN:
 		help = "a:add  i:import  d:delete  e:enable/disable  R:reload  1-4:tabs  q:quit"
 	case tabHistory:
