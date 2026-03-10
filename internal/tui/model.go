@@ -410,7 +410,7 @@ func (m Model) submitInput() (tea.Model, tea.Cmd) {
 				if err := m.vpnPool.AddConfig(m.vpnAddName, content); err != nil {
 					m.setMessage(fmt.Sprintf("Error: %v", err))
 				} else {
-					m.setMessage(fmt.Sprintf("Added VPN config %q", m.vpnAddName))
+					m.setMessage(fmt.Sprintf("Added %q (disabled - press 'e' to enable)", m.vpnAddName))
 				}
 			}
 			m.vpnAddPhase = 0
@@ -422,7 +422,7 @@ func (m Model) submitInput() (tea.Model, tea.Cmd) {
 			if err := m.vpnPool.ImportConfig(value); err != nil {
 				m.setMessage(fmt.Sprintf("Error importing: %v", err))
 			} else {
-				m.setMessage("Config imported successfully")
+				m.setMessage("Config imported (disabled - press 'e' to enable)")
 			}
 		}
 		m.inputMode = inputNone

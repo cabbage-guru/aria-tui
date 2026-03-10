@@ -103,6 +103,7 @@ func (p *Pool) AddConfig(name, contents string) error {
 		Path:     path,
 		Contents: contents,
 	}
+	p.disabled[baseName] = true
 
 	return nil
 }
