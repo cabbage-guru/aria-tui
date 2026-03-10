@@ -349,12 +349,29 @@ func (m Model) handleVPNKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleHistoryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	entries := m.hist.All()
+
 	switch msg.String() {
 	case "C":
 		m.hist.Clear()
+		m.cursor = 0
 		m.setMessage("History cleared")
 		return m, nil
+
+	case "r":
+		if m.cursor < len(entries) {
+			e := entries[m.cursor]
+			m.dlMgr.Add(e.URL)
+			m.setMessage(fmt.Sprintf("Re-queued: %s", e.URL))
+		}
+		return m, nil
 	}
+
+	// Clamp cursor
+	if m.cursor >= len(entries) && len(entries) > 0 {
+		m.cursor = len(entries) - 1
+	}
+
 	return m, nil
 }
 
@@ -688,9 +705,8 @@ func (m Model) renderHistory() string {
 	if maxItems > len(entries) {
 		maxItems = len(entries)
 	}
-	start := len(entries) - maxItems
 
-	for i := start; i < len(entries); i++ {
+	for i := 0; i < maxItems; i++ {
 		e := entries[i]
 		prefix := "  "
 		if i == m.cursor {
@@ -781,7 +797,7 @@ func (m Model) renderHelp() string {
 	case tabVPN:
 		help = "a:add  i:import  d:delete  e:enable/disable  R:reload  1-4:tabs  q:quit"
 	case tabHistory:
-		help = "C:clear history  1-4:tabs  q:quit"
+		help = "r:retry  C:clear history  1-4:tabs  q:quit"
 	case tabSettings:
 		help = "m:max concurrent  s:stale timeout  1-4:tabs  q:quit"
 	}
