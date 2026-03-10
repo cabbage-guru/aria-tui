@@ -669,10 +669,17 @@ func (m Model) renderDownloads() string {
 		// Progress line for active downloads
 		if dl.Status == download.StatusDownloading || dl.Status == download.StatusStale {
 			bar := renderProgressBar(dl.Progress(), 30)
-			info := fmt.Sprintf("   %s  %s / %s  %s  VPN: %s",
+			eta := ""
+			if dl.Speed > 0 && dl.TotalSize > 0 {
+				remaining := dl.TotalSize - dl.CompletedSize
+				secs := remaining / dl.Speed
+				eta = fmt.Sprintf("  ETA %s", formatDuration(time.Duration(secs)*time.Second))
+			}
+			info := fmt.Sprintf("   %s  %s / %s  %s%s  VPN: %s",
 				bar,
 				dl.CompletedStr(), dl.TotalStr(),
 				dl.SpeedStr(),
+				eta,
 				dl.VPNConfig)
 
 			// Show time without progress for active downloads approaching stale
@@ -883,6 +890,20 @@ func renderProgressBar(percent float64, width int) string {
 	}
 	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
 	return fmt.Sprintf("[%s] %5.1f%%", bar, percent)
+}
+
+func formatDuration(d time.Duration) string {
+	d = d.Truncate(time.Second)
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%dh%02dm%02ds", h, m, s)
+	}
+	if m > 0 {
+		return fmt.Sprintf("%dm%02ds", m, s)
+	}
+	return fmt.Sprintf("%ds", s)
 }
 
 func mutedStyle(s string) string {
