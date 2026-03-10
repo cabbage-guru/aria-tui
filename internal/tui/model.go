@@ -15,6 +15,7 @@ import (
 	"github.com/cabbage-guru/aria-tui/internal/config"
 	"github.com/cabbage-guru/aria-tui/internal/download"
 	"github.com/cabbage-guru/aria-tui/internal/history"
+	"github.com/cabbage-guru/aria-tui/internal/ipc"
 	"github.com/cabbage-guru/aria-tui/internal/vpn"
 )
 
@@ -41,6 +42,9 @@ const (
 
 type tickMsg time.Time
 
+// ipcURLMsg is sent when a URL arrives via the Unix socket from 'aria-tui clip'.
+type ipcURLMsg string
+
 type Model struct {
 	cfg     *config.Config
 	vpnPool *vpn.Pool
@@ -63,9 +67,12 @@ type Model struct {
 	// VPN config add state
 	vpnAddName  string
 	vpnAddPhase int // 0 = name, 1 = content
+
+	// IPC listener for 'aria-tui clip' commands
+	ipcListener *ipc.Listener
 }
 
-func NewModel(cfg *config.Config, vpnPool *vpn.Pool, dlMgr *download.Manager, hist *history.Store) Model {
+func NewModel(cfg *config.Config, vpnPool *vpn.Pool, dlMgr *download.Manager, hist *history.Store, ipcLn *ipc.Listener) Model {
 	ti := textinput.New()
 	ti.CharLimit = 2048
 
@@ -75,14 +82,15 @@ func NewModel(cfg *config.Config, vpnPool *vpn.Pool, dlMgr *download.Manager, hi
 	ta.CharLimit = 8192
 
 	return Model{
-		cfg:       cfg,
-		vpnPool:   vpnPool,
-		dlMgr:     dlMgr,
-		hist:      hist,
-		textInput: ti,
-		textArea:  ta,
-		width:     120,
-		height:    40,
+		cfg:         cfg,
+		vpnPool:     vpnPool,
+		dlMgr:       dlMgr,
+		hist:        hist,
+		textInput:   ti,
+		textArea:    ta,
+		width:       120,
+		height:      40,
+		ipcListener: ipcLn,
 	}
 }
 
@@ -93,7 +101,22 @@ func tickCmd() tea.Cmd {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tickCmd()
+	return tea.Batch(tickCmd(), m.waitForIPC())
+}
+
+// waitForIPC returns a Cmd that blocks until a URL arrives on the IPC channel.
+func (m Model) waitForIPC() tea.Cmd {
+	if m.ipcListener == nil {
+		return nil
+	}
+	ch := m.ipcListener.URLs()
+	return func() tea.Msg {
+		url, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return ipcURLMsg(url)
+	}
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -109,6 +132,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.message = ""
 		}
 		return m, tickCmd()
+
+	case ipcURLMsg:
+		u := string(msg)
+		m.dlMgr.Add(u)
+		m.activeTab = tabDownloads
+		m.setMessage(fmt.Sprintf("Queued (remote): %s", u))
+		return m, m.waitForIPC()
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)

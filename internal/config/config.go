@@ -33,6 +33,10 @@ func WireGuardDir() string {
 	return dir
 }
 
+func SocketPath() string {
+	return filepath.Join(ConfigDir(), "aria-tui.sock")
+}
+
 func HistoryPath() string {
 	return filepath.Join(ConfigDir(), "history.json")
 }

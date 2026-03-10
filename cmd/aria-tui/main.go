@@ -11,11 +11,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atotto/clipboard"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/cabbage-guru/aria-tui/internal/config"
 	"github.com/cabbage-guru/aria-tui/internal/download"
 	"github.com/cabbage-guru/aria-tui/internal/history"
+	"github.com/cabbage-guru/aria-tui/internal/ipc"
 	"github.com/cabbage-guru/aria-tui/internal/tui"
 	"github.com/cabbage-guru/aria-tui/internal/tunnel"
 	"github.com/cabbage-guru/aria-tui/internal/vpn"
@@ -32,6 +34,9 @@ func main() {
 			return
 		case "list-vpn":
 			handleListVPN()
+			return
+		case "clip":
+			handleClip()
 			return
 		case "check":
 			handleCheck()
@@ -53,6 +58,7 @@ func printHelp() {
 
 Usage:
   aria-tui                     Start the TUI
+  aria-tui clip                Paste clipboard URL to running TUI (for global hotkeys)
   aria-tui import <file>...    Import WireGuard .conf files
   aria-tui import-dir <dir>    Import all .conf files from a directory
   aria-tui list-vpn            List all VPN configurations
@@ -80,6 +86,29 @@ Prerequisites:
 
 Config directory: ~/.config/aria-tui/
 VPN configs:      ~/.config/aria-tui/wireguard/`)
+}
+
+func handleClip() {
+	text, err := clipboard.ReadAll()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading clipboard: %v\n", err)
+		os.Exit(1)
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		fmt.Fprintln(os.Stderr, "Clipboard is empty")
+		os.Exit(1)
+	}
+	u, err := url.Parse(text)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		fmt.Fprintf(os.Stderr, "Clipboard does not contain a valid URL: %s\n", text)
+		os.Exit(1)
+	}
+	if err := ipc.Send(text); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Queued: %s\n", text)
 }
 
 func handleCheck() {
@@ -519,8 +548,17 @@ func runTUI() {
 	dlMgr := download.NewManager(cfg, vpnPool, tunnelMgr, hist)
 	dlMgr.Start()
 
+	// Start IPC listener for 'aria-tui clip' commands
+	ipcLn, err := ipc.NewListener()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not start IPC listener: %v\n", err)
+	}
+	if ipcLn != nil {
+		defer ipcLn.Close()
+	}
+
 	// Create and run TUI
-	model := tui.NewModel(cfg, vpnPool, dlMgr, hist)
+	model := tui.NewModel(cfg, vpnPool, dlMgr, hist, ipcLn)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 
 	if _, err := p.Run(); err != nil {
