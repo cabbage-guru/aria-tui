@@ -169,9 +169,26 @@ func (m *Manager) Start() {
 	go m.monitorLoop()
 }
 
-// Stop cancels all operations and cleans up.
+// Stop gracefully shuts down: records interrupted downloads to history, then tears down tunnels.
 func (m *Manager) Stop() {
 	m.cancel()
+
+	m.mu.Lock()
+	interrupted := make([]*Download, 0)
+	for _, dl := range m.downloads {
+		switch dl.Status {
+		case StatusDownloading, StatusStarting, StatusQueued, StatusStale:
+			dl.Status = StatusCancelled
+			dl.Error = "interrupted by shutdown"
+			interrupted = append(interrupted, dl)
+		}
+	}
+	m.mu.Unlock()
+
+	for _, dl := range interrupted {
+		m.recordHistory(dl)
+	}
+
 	m.tunnelMgr.StopAll(context.Background())
 }
 
