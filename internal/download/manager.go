@@ -122,30 +122,42 @@ func formatBytes(b int64) string {
 
 // Manager coordinates downloads across WireGuard tunnels.
 type Manager struct {
-	mu        sync.RWMutex
-	downloads []*Download
-	queue     []string // IDs of queued downloads
-	cfg       *config.Config
-	vpnPool   *vpn.Pool
-	tunnelMgr *tunnel.Manager
-	hist      *history.Store
-	nextID    int
-	ctx       context.Context
-	cancel    context.CancelFunc
+	mu          sync.RWMutex
+	downloads   []*Download
+	queue       []string // IDs of queued downloads
+	rpcClients  map[int]*Aria2Client // rpcPort -> cached client (reuses http.Client connection pool)
+	cfg         *config.Config
+	vpnPool     *vpn.Pool
+	tunnelMgr   *tunnel.Manager
+	hist        *history.Store
+	nextID      int
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
 func NewManager(cfg *config.Config, vpnPool *vpn.Pool, tunnelMgr *tunnel.Manager, hist *history.Store) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
-		downloads: make([]*Download, 0),
-		queue:     make([]string, 0),
-		cfg:       cfg,
-		vpnPool:   vpnPool,
-		tunnelMgr: tunnelMgr,
-		hist:      hist,
-		ctx:       ctx,
-		cancel:    cancel,
+		downloads:  make([]*Download, 0),
+		queue:      make([]string, 0),
+		rpcClients: make(map[int]*Aria2Client),
+		cfg:        cfg,
+		vpnPool:    vpnPool,
+		tunnelMgr:  tunnelMgr,
+		hist:       hist,
+		ctx:        ctx,
+		cancel:     cancel,
 	}
+}
+
+// getOrCreateClient returns a cached Aria2Client for the given port, creating one if needed.
+func (m *Manager) getOrCreateClient(port int) *Aria2Client {
+	if c, ok := m.rpcClients[port]; ok {
+		return c
+	}
+	c := NewAria2Client(port, tunnel.RPCSecret(port))
+	m.rpcClients[port] = c
+	return c
 }
 
 // Add queues a new download.
@@ -175,20 +187,25 @@ func (m *Manager) Start() {
 func (m *Manager) Stop() {
 	m.cancel()
 
+	type interruptedDL struct {
+		dl      *Download
+		vpnName string
+	}
 	m.mu.Lock()
-	interrupted := make([]*Download, 0)
+	var interrupted []interruptedDL
 	for _, dl := range m.downloads {
 		switch dl.Status {
 		case StatusDownloading, StatusStarting, StatusQueued, StatusStale:
+			vpnName := dl.VPNConfig
 			dl.Status = StatusCancelled
 			dl.Error = "interrupted by shutdown"
-			interrupted = append(interrupted, dl)
+			interrupted = append(interrupted, interruptedDL{dl, vpnName})
 		}
 	}
 	m.mu.Unlock()
 
-	for _, dl := range interrupted {
-		m.recordHistory(dl)
+	for _, item := range interrupted {
+		m.recordHistory(item.dl, item.vpnName)
 	}
 
 	// Clear persisted queue since all downloads were recorded to history
@@ -257,6 +274,7 @@ func (m *Manager) Restart(id string) {
 			d.RPCPort = 0
 			d.VPNConfig = ""
 			d.Interface = ""
+			d.Retries = 0
 			d.StaleNotified = false
 			d.RateLimited = false
 			d.LastProgress = time.Time{}
@@ -372,7 +390,7 @@ func (m *Manager) processQueue() {
 			dl.Status = StatusError
 			dl.Error = fmt.Sprintf("Tunnel start failed after %d retries: %v", dl.Retries, err)
 			m.mu.Unlock()
-			m.recordHistory(dl)
+			m.recordHistory(dl, wgCfg.Name)
 		} else {
 			dl.Status = StatusQueued
 			dl.Error = fmt.Sprintf("Tunnel start failed (retry %d/5): %v", dl.Retries, err)
@@ -422,7 +440,7 @@ func (m *Manager) processQueue() {
 			dl.Status = StatusError
 			dl.Error = fmt.Sprintf("%s (failed after %d retries)", errMsg, dl.Retries)
 			m.mu.Unlock()
-			m.recordHistory(dl)
+			m.recordHistory(dl, wgCfg.Name)
 		} else {
 			dl.Status = StatusQueued
 			dl.Error = fmt.Sprintf("%s (retry %d/5)", errMsg, dl.Retries)
@@ -441,7 +459,7 @@ func (m *Manager) processQueue() {
 		dl.Status = StatusError
 		dl.Error = fmt.Sprintf("Failed to add URL: %v", err)
 		m.mu.Unlock()
-		m.recordHistory(dl)
+		m.recordHistory(dl, wgCfg.Name)
 		return
 	}
 
@@ -483,23 +501,38 @@ func isRateLimited(errorCode, errorMessage string) bool {
 }
 
 func (m *Manager) updateStatuses() {
+	// Snapshot active downloads info under RLock — only read stable identifiers.
+	type activeInfo struct {
+		dl      *Download
+		gid     string
+		rpcPort int
+	}
+
 	m.mu.RLock()
-	active := make([]*Download, 0)
+	var active []activeInfo
 	for _, d := range m.downloads {
 		if d.Status == StatusDownloading && d.GID != "" && d.RPCPort != 0 {
-			active = append(active, d)
+			active = append(active, activeInfo{dl: d, gid: d.GID, rpcPort: d.RPCPort})
 		}
 	}
 	m.mu.RUnlock()
 
-	for _, dl := range active {
-		client := NewAria2Client(dl.RPCPort, tunnel.RPCSecret(dl.RPCPort))
-		status, err := client.TellStatus(dl.GID)
+	for _, info := range active {
+		client := m.getOrCreateClient(info.rpcPort)
+		status, err := client.TellStatus(info.gid)
 		if err != nil {
 			continue
 		}
 
 		m.mu.Lock()
+		dl := info.dl
+
+		// Recheck: download may have been cancelled/removed while we were polling.
+		if dl.Status != StatusDownloading {
+			m.mu.Unlock()
+			continue
+		}
+
 		dl.TotalSize = status.TotalLength
 		dl.CompletedSize = status.CompletedLength
 		dl.Speed = status.DownloadSpeed
@@ -516,7 +549,7 @@ func (m *Manager) updateStatuses() {
 			dl.VPNConfig = ""
 			m.mu.Unlock()
 			go m.cleanupTunnel(vpnName)
-			m.recordHistory(dl)
+			m.recordHistory(dl, vpnName)
 			continue
 
 		case "error":
@@ -548,7 +581,7 @@ func (m *Manager) updateStatuses() {
 			dl.VPNConfig = ""
 			m.mu.Unlock()
 			go m.cleanupTunnel(vpnName)
-			m.recordHistory(dl)
+			m.recordHistory(dl, vpnName)
 			continue
 
 		case "active":
@@ -573,6 +606,13 @@ func (m *Manager) updateStatuses() {
 func (m *Manager) cleanupTunnel(vpnName string) {
 	if vpnName == "" {
 		return
+	}
+	// Evict cached RPC client for the tunnel's port before tearing it down.
+	tun := m.tunnelMgr.GetTunnel(vpnName)
+	if tun != nil {
+		m.mu.Lock()
+		delete(m.rpcClients, tun.RPCPort)
+		m.mu.Unlock()
 	}
 	m.tunnelMgr.StopTunnel(context.Background(), vpnName)
 	m.vpnPool.Release(vpnName)
@@ -614,11 +654,13 @@ func (m *Manager) LoadQueue() int {
 	return len(urls)
 }
 
-func (m *Manager) recordHistory(dl *Download) {
+// recordHistory writes a download result to history. vpnName must be captured
+// by the caller before clearing dl.VPNConfig to avoid recording an empty value.
+func (m *Manager) recordHistory(dl *Download, vpnName string) {
 	entry := history.Entry{
 		URL:         dl.URL,
 		Filename:    dl.Filename,
-		VPNConfig:   dl.VPNConfig,
+		VPNConfig:   vpnName,
 		StartedAt:   dl.StartedAt,
 		CompletedAt: dl.CompletedAt,
 		TotalSize:   dl.TotalSize,

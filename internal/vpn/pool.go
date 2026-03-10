@@ -91,6 +91,13 @@ func (p *Pool) AddConfig(name, contents string) error {
 	}
 	baseName := strings.TrimSuffix(name, ".conf")
 
+	// Sanitize: use only the base filename to prevent path traversal (e.g. "../foo").
+	name = filepath.Base(name)
+	baseName = filepath.Base(baseName)
+	if name == "." || name == ".." || baseName == "" {
+		return fmt.Errorf("invalid config name")
+	}
+
 	dir := config.WireGuardDir()
 	path := filepath.Join(dir, name)
 

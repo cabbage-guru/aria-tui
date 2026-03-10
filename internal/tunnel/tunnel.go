@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -83,8 +84,9 @@ func (m *Manager) StartTunnel(ctx context.Context, name string, wgConfigContents
 		return nil, fmt.Errorf("creating userspace WG tunnel: %w", err)
 	}
 
-	// Start HTTP CONNECT proxy that dials through the userspace WG tunnel
-	proxyLogger := log.New(os.Stderr, "", log.LstdFlags)
+	// Start HTTP CONNECT proxy that dials through the userspace WG tunnel.
+	// Discard per-connection logs in production; errors still surface via dial stats.
+	proxyLogger := log.New(io.Discard, "", 0)
 	proxy, err := StartConnectProxy(tunnelCtx, name, wg.DialContext, proxyLogger)
 	if err != nil {
 		wg.Close()

@@ -529,6 +529,12 @@ func (m Model) submitInput() (tea.Model, tea.Cmd) {
 	switch m.inputMode {
 	case inputAddURL:
 		if value != "" {
+			u, err := url.Parse(value)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+				m.setMessage("Invalid URL (must start with http:// or https://)")
+				m.inputMode = inputNone
+				return m, nil
+			}
 			m.dlMgr.Add(value)
 			m.setMessage("Download queued")
 		}
@@ -666,7 +672,7 @@ func (m Model) renderHeader() string {
 	stats := fmt.Sprintf(" VPN: %d/%d  Active: %d/%d",
 		m.vpnPool.InUseCount(), m.vpnPool.Total(),
 		m.dlMgr.ActiveCount(), m.cfg.MaxConcurrent)
-	return headerStyle.Copy().Width(m.width).Render(title + stats)
+	return headerStyle.Width(m.width).Render(title + stats)
 }
 
 func (m Model) renderTabs() string {

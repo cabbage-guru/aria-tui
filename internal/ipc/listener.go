@@ -69,7 +69,11 @@ func (l *Listener) handle(conn net.Conn) {
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line != "" {
-			l.urlChan <- line
+			select {
+			case l.urlChan <- line:
+			default:
+				// Channel full — drop URL rather than blocking the sender indefinitely.
+			}
 		}
 	}
 }
