@@ -322,11 +322,11 @@ func (m *Manager) processQueue() {
 	// Acquire a VPN config
 	wgCfg := m.vpnPool.Acquire()
 	if wgCfg == nil {
+		// No VPN available right now — put it back in the queue
 		m.mu.Lock()
-		dl.Status = StatusError
-		dl.Error = "No VPN configs available"
+		dl.Status = StatusQueued
+		m.queue = append(m.queue, dl.ID)
 		m.mu.Unlock()
-		m.recordHistory(dl)
 		return
 	}
 
