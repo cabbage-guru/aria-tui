@@ -28,14 +28,15 @@ func IsInstalled() bool {
 // that runs 'aria-tui clip'. The user can then assign a global keyboard shortcut
 // via System Settings > Keyboard > Keyboard Shortcuts > Services.
 func Install() error {
-	binaryPath, err := exec.LookPath("aria-tui")
+	binaryPath, err := os.Executable()
 	if err != nil {
-		// Fall back to the current executable
-		binaryPath, err = os.Executable()
+		binaryPath, err = exec.LookPath("aria-tui")
 		if err != nil {
 			return fmt.Errorf("cannot find aria-tui binary: %w", err)
 		}
 	}
+	// Resolve symlinks so the absolute path survives across environments
+	binaryPath, _ = filepath.EvalSymlinks(binaryPath)
 
 	wfDir := workflowPath()
 	contentsDir := filepath.Join(wfDir, "Contents")
@@ -132,7 +133,12 @@ func Install() error {
 				<dict>
 					<key>COMMAND_STRING</key>
 					<string>export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-%s clip 2&gt;/dev/null</string>
+OUTPUT=$(%s clip 2&gt;&amp;1)
+if [ $? -eq 0 ]; then
+  osascript -e "display notification \"$OUTPUT\" with title \"aria-tui\""
+else
+  osascript -e "display notification \"$OUTPUT\" with title \"aria-tui\" subtitle \"Error\""
+fi</string>
 					<key>CheckedForUserDefaultShell</key>
 					<true/>
 					<key>inputMethod</key>
@@ -205,11 +211,10 @@ func Uninstall() error {
 func Instructions() string {
 	return `Quick Action installed! To assign a global keyboard shortcut:
 
-  1. Open System Settings > Keyboard > Keyboard Shortcuts
-  2. Click "Services" (or "App Shortcuts" > "Services") in the left sidebar
-  3. Scroll to "General" and find "Aria TUI - Queue Download"
-  4. Click "none" next to it and press your desired shortcut
+  1. Open System Settings > Keyboard > Keyboard Shortcuts > Services
+  2. Scroll to "General" and find "Aria TUI - Queue Download"
+  3. Click "none" next to it and press your desired shortcut
      (e.g. Cmd+Shift+Ctrl+D)
 
-Then copy any URL and press the shortcut from any app to queue it.`
+You'll see a macOS notification on success/failure. The TUI must be running.`
 }
