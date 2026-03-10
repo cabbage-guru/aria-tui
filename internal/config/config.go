@@ -41,6 +41,10 @@ func HistoryPath() string {
 	return filepath.Join(ConfigDir(), "history.json")
 }
 
+func QueuePath() string {
+	return filepath.Join(ConfigDir(), "queue.json")
+}
+
 func ConfigPath() string {
 	return filepath.Join(ConfigDir(), "config.json")
 }

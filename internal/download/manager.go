@@ -2,6 +2,7 @@ package download
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -149,8 +150,6 @@ func NewManager(cfg *config.Config, vpnPool *vpn.Pool, tunnelMgr *tunnel.Manager
 // Add queues a new download.
 func (m *Manager) Add(url string) *Download {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	m.nextID++
 	dl := &Download{
 		ID:     fmt.Sprintf("dl-%d", m.nextID),
@@ -159,7 +158,9 @@ func (m *Manager) Add(url string) *Download {
 	}
 	m.downloads = append(m.downloads, dl)
 	m.queue = append(m.queue, dl.ID)
+	m.mu.Unlock()
 
+	m.saveQueue()
 	return dl
 }
 
@@ -188,6 +189,9 @@ func (m *Manager) Stop() {
 	for _, dl := range interrupted {
 		m.recordHistory(dl)
 	}
+
+	// Clear persisted queue since all downloads were recorded to history
+	os.Remove(config.QueuePath())
 
 	m.tunnelMgr.StopAll(context.Background())
 }
@@ -222,8 +226,6 @@ func (m *Manager) ActiveCount() int {
 // Cancel cancels a download.
 func (m *Manager) Cancel(id string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	for _, d := range m.downloads {
 		if d.ID == id {
 			d.Status = StatusCancelled
@@ -231,6 +233,8 @@ func (m *Manager) Cancel(id string) {
 			break
 		}
 	}
+	m.mu.Unlock()
+	m.saveQueue()
 }
 
 // Restart restarts a stale or failed download.
@@ -262,8 +266,6 @@ func (m *Manager) Restart(id string) {
 // Remove removes a download from the list.
 func (m *Manager) Remove(id string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	for i, d := range m.downloads {
 		if d.ID == id {
 			if d.Status == StatusStarting || d.Status == StatusDownloading {
@@ -281,6 +283,8 @@ func (m *Manager) Remove(id string) {
 			break
 		}
 	}
+	m.mu.Unlock()
+	m.saveQueue()
 }
 
 // StaleTimeout returns the configured stale timeout duration.
@@ -538,6 +542,42 @@ func (m *Manager) cleanupDownload(dl *Download) {
 	}
 }
 
+// saveQueue persists all queued/active URLs to disk so they survive restarts.
+func (m *Manager) saveQueue() {
+	m.mu.RLock()
+	urls := make([]string, 0)
+	for _, d := range m.downloads {
+		switch d.Status {
+		case StatusQueued, StatusStarting, StatusDownloading, StatusStale:
+			urls = append(urls, d.URL)
+		}
+	}
+	m.mu.RUnlock()
+
+	data, err := json.Marshal(urls)
+	if err != nil {
+		return
+	}
+	os.WriteFile(config.QueuePath(), data, 0600)
+}
+
+// LoadQueue re-adds URLs that were persisted from a previous session.
+func (m *Manager) LoadQueue() int {
+	data, err := os.ReadFile(config.QueuePath())
+	if err != nil {
+		return 0
+	}
+	var urls []string
+	if err := json.Unmarshal(data, &urls); err != nil {
+		return 0
+	}
+	for _, u := range urls {
+		m.Add(u)
+	}
+	// Clear the file now that they're loaded (Add will re-persist them)
+	return len(urls)
+}
+
 func (m *Manager) recordHistory(dl *Download) {
 	entry := history.Entry{
 		URL:         dl.URL,
@@ -562,4 +602,5 @@ func (m *Manager) recordHistory(dl *Download) {
 	}
 
 	m.hist.Add(entry)
+	m.saveQueue()
 }

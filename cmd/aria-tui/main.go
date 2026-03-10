@@ -546,6 +546,9 @@ func runTUI() {
 
 	// Initialize download manager
 	dlMgr := download.NewManager(cfg, vpnPool, tunnelMgr, hist)
+	if n := dlMgr.LoadQueue(); n > 0 {
+		fmt.Fprintf(os.Stderr, "Restored %d queued URL(s) from previous session\n", n)
+	}
 	dlMgr.Start()
 
 	// Start IPC listener for 'aria-tui clip' commands
