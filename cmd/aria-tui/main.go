@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -118,48 +117,47 @@ func handleClip() {
 }
 
 func handleCleanup() {
+	myPID := os.Getpid()
 	fmt.Println("Cleaning up orphaned aria-tui resources...")
 
-	// 1. Kill orphaned aria2c processes spawned by aria-tui
-	killOrphanedAria2c()
+	// 1. Kill orphaned aria-tui TUI processes (which hold WireGuard UDP sockets).
+	//    The userspace WG tunnels live inside the aria-tui process — killing child
+	//    aria2c processes alone does NOT close the VPN connections.
+	killOrphanedProcesses("aria-tui", myPID)
 
-	// 2. Remove stale IPC socket
+	// 2. Kill orphaned aria2c processes spawned by aria-tui
+	killOrphanedProcesses("aria2c.*rpc-secret=aria-tui", myPID)
+
+	// 3. Remove stale IPC socket
 	sockPath := config.SocketPath()
 	if _, err := os.Stat(sockPath); err == nil {
-		// Check if a TUI is actually listening
-		conn, err := net.DialTimeout("unix", sockPath, 500*time.Millisecond)
-		if err != nil {
-			// Nobody listening — stale socket
-			os.Remove(sockPath)
-			fmt.Printf("  Removed stale socket: %s\n", sockPath)
-		} else {
-			conn.Close()
-			fmt.Println("  Socket is active (TUI is running), skipping")
-		}
+		// After killing TUI processes above, give a moment for the socket to be released
+		os.Remove(sockPath)
+		fmt.Printf("  Removed socket: %s\n", sockPath)
 	}
 
-	// 3. Remove orphaned aria2c temp log files
+	// 4. Remove orphaned aria2c temp log files
 	matches, _ := filepath.Glob(filepath.Join(os.TempDir(), "aria2c-*.log"))
 	for _, m := range matches {
 		os.Remove(m)
 		fmt.Printf("  Removed temp log: %s\n", m)
 	}
 
-	// 4. Clear stale queue file
+	// 5. Clear stale queue file
 	queuePath := config.QueuePath()
 	if data, err := os.ReadFile(queuePath); err == nil && len(data) > 0 {
 		os.Remove(queuePath)
 		fmt.Printf("  Removed stale queue: %s\n", queuePath)
 	}
 
-	fmt.Println("Done.")
+	fmt.Println("Done. VPN connections should be released shortly.")
 }
 
-func killOrphanedAria2c() {
-	// Find aria2c processes with aria-tui RPC secret in their arguments
-	out, err := exec.Command("pgrep", "-f", "aria2c.*rpc-secret=aria-tui").Output()
+// killOrphanedProcesses finds and kills processes matching a pgrep pattern,
+// skipping the given PID (our own process).
+func killOrphanedProcesses(pattern string, skipPID int) {
+	out, err := exec.Command("pgrep", "-f", pattern).Output()
 	if err != nil {
-		// No matching processes
 		return
 	}
 
@@ -169,14 +167,17 @@ func killOrphanedAria2c() {
 		if _, err := fmt.Sscanf(pidStr, "%d", &pid); err != nil {
 			continue
 		}
+		if pid == skipPID {
+			continue
+		}
 		proc, err := os.FindProcess(pid)
 		if err != nil {
 			continue
 		}
 		if err := proc.Kill(); err != nil {
-			fmt.Printf("  Failed to kill aria2c PID %d: %v\n", pid, err)
+			fmt.Printf("  Failed to kill PID %d: %v\n", pid, err)
 		} else {
-			fmt.Printf("  Killed orphaned aria2c PID %d\n", pid)
+			fmt.Printf("  Killed orphaned process PID %d (%s)\n", pid, pattern)
 		}
 	}
 }
