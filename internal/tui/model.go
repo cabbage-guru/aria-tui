@@ -15,6 +15,7 @@ import (
 	"github.com/cabbage-guru/aria-tui/internal/config"
 	"github.com/cabbage-guru/aria-tui/internal/download"
 	"github.com/cabbage-guru/aria-tui/internal/history"
+	"github.com/cabbage-guru/aria-tui/internal/hotkey"
 	"github.com/cabbage-guru/aria-tui/internal/ipc"
 	"github.com/cabbage-guru/aria-tui/internal/vpn"
 )
@@ -501,6 +502,22 @@ func (m Model) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.textInput.SetValue("")
 		m.textInput.Focus()
 		return m, m.textInput.Cursor.BlinkCmd()
+
+	case "g":
+		if hotkey.IsInstalled() {
+			if err := hotkey.Uninstall(); err != nil {
+				m.setMessage(fmt.Sprintf("Error removing hotkey: %v", err))
+			} else {
+				m.setMessage("Global hotkey Quick Action removed")
+			}
+		} else {
+			if err := hotkey.Install(); err != nil {
+				m.setMessage(fmt.Sprintf("Error: %v", err))
+			} else {
+				m.setMessage(hotkey.Instructions())
+			}
+		}
+		return m, nil
 	}
 	return m, nil
 }
@@ -893,6 +910,18 @@ func (m Model) renderSettings() string {
 		{"Download Dir", m.cfg.DownloadDir, "Where downloaded files are saved"},
 	}
 
+	hotkeyStatus := "Not installed"
+	hotkeyDesc := "Install macOS Quick Action for 'aria-tui clip' (press g)"
+	if hotkey.IsInstalled() {
+		hotkeyStatus = "Installed"
+		hotkeyDesc = "Remove macOS Quick Action (press g)"
+	}
+	settings = append(settings, struct {
+		key   string
+		value string
+		desc  string
+	}{"Global Hotkey (g)", hotkeyStatus, hotkeyDesc})
+
 	for i, s := range settings {
 		prefix := "  "
 		if i == m.cursor {
@@ -920,7 +949,7 @@ func (m Model) renderHelp() string {
 	case tabHistory:
 		help = "r:retry  C:clear history  1-4:tabs  q:quit"
 	case tabSettings:
-		help = "m:max concurrent  s:stale timeout  1-4:tabs  q:quit"
+		help = "m:max concurrent  s:stale timeout  g:global hotkey  1-4:tabs  q:quit"
 	}
 
 	if m.inputMode != inputNone {
