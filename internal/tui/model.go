@@ -684,15 +684,13 @@ func (m Model) renderHistory() string {
 	b.WriteString(fmt.Sprintf("  Total: %d  Completed: %d  Failed: %d\n\n",
 		len(entries), len(completed), len(failed)))
 
-	maxItems := m.height - 10
-	if maxItems < 5 {
-		maxItems = 5
-	}
+	maxItems := 10
 	if maxItems > len(entries) {
 		maxItems = len(entries)
 	}
+	start := len(entries) - maxItems
 
-	for i := 0; i < maxItems; i++ {
+	for i := start; i < len(entries); i++ {
 		e := entries[i]
 		prefix := "  "
 		if i == m.cursor {
@@ -739,7 +737,7 @@ func (m Model) renderHistory() string {
 	}
 
 	if len(entries) > maxItems {
-		b.WriteString(mutedStyle(fmt.Sprintf("\n  ... and %d more entries", len(entries)-maxItems)))
+		b.WriteString(mutedStyle(fmt.Sprintf("\n  ... and %d older entries", len(entries)-maxItems)))
 	}
 
 	return b.String()
