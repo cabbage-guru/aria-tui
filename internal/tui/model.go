@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -48,21 +49,25 @@ type Model struct {
 	cursor     int
 	width      int
 	height     int
-	inputMode  inputMode
-	textInput  textinput.Model
-	pasteInput string // for multiline paste (VPN config)
-	message    string
-	messageAt  time.Time
+	inputMode inputMode
+	textInput textinput.Model
+	textArea  textarea.Model
+	message   string
+	messageAt time.Time
 
 	// VPN config add state
-	vpnAddName    string
-	vpnAddContent strings.Builder
-	vpnAddPhase   int // 0 = name, 1 = content
+	vpnAddName  string
+	vpnAddPhase int // 0 = name, 1 = content
 }
 
 func NewModel(cfg *config.Config, vpnPool *vpn.Pool, dlMgr *download.Manager, hist *history.Store) Model {
 	ti := textinput.New()
 	ti.CharLimit = 2048
+
+	ta := textarea.New()
+	ta.SetWidth(80)
+	ta.SetHeight(10)
+	ta.CharLimit = 8192
 
 	return Model{
 		cfg:       cfg,
@@ -70,6 +75,7 @@ func NewModel(cfg *config.Config, vpnPool *vpn.Pool, dlMgr *download.Manager, hi
 		dlMgr:     dlMgr,
 		hist:      hist,
 		textInput: ti,
+		textArea:  ta,
 		width:     120,
 		height:    40,
 	}
@@ -105,7 +111,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	if m.inputMode != inputNone {
 		var cmd tea.Cmd
-		m.textInput, cmd = m.textInput.Update(msg)
+		if m.inputMode == inputAddVPN && m.vpnAddPhase == 1 {
+			m.textArea, cmd = m.textArea.Update(msg)
+		} else {
+			m.textInput, cmd = m.textInput.Update(msg)
+		}
 		return m, cmd
 	}
 
@@ -177,6 +187,23 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Textarea mode for VPN config content (phase 1)
+	if m.inputMode == inputAddVPN && m.vpnAddPhase == 1 {
+		switch msg.String() {
+		case "esc":
+			m.inputMode = inputNone
+			m.textArea.Blur()
+			m.vpnAddPhase = 0
+			return m, nil
+		case "ctrl+s":
+			return m.submitInput()
+		}
+		var cmd tea.Cmd
+		m.textArea, cmd = m.textArea.Update(msg)
+		return m, cmd
+	}
+
+	// Single-line text input mode
 	switch msg.String() {
 	case "esc":
 		m.inputMode = inputNone
@@ -364,21 +391,23 @@ func (m Model) submitInput() (tea.Model, tea.Cmd) {
 
 	case inputAddVPN:
 		if m.vpnAddPhase == 0 {
-			// Got the name, now get content
+			// Got the name, now switch to textarea for content
 			if value == "" {
 				m.inputMode = inputNone
 				return m, nil
 			}
 			m.vpnAddName = value
 			m.vpnAddPhase = 1
-			m.textInput.Placeholder = "Paste WireGuard config content (full [Interface]/[Peer] block)..."
-			m.textInput.SetValue("")
-			m.textInput.Focus()
-			return m, m.textInput.Cursor.BlinkCmd()
+			m.textArea.SetValue("")
+			m.textArea.Placeholder = "Paste WireGuard config here..."
+			m.textArea.Focus()
+			return m, m.textArea.Cursor.BlinkCmd()
 		} else {
-			// Got the content
-			if value != "" {
-				if err := m.vpnPool.AddConfig(m.vpnAddName, value); err != nil {
+			// Got the content from textarea
+			content := strings.TrimSpace(m.textArea.Value())
+			m.textArea.Blur()
+			if content != "" {
+				if err := m.vpnPool.AddConfig(m.vpnAddName, content); err != nil {
 					m.setMessage(fmt.Sprintf("Error: %v", err))
 				} else {
 					m.setMessage(fmt.Sprintf("Added VPN config %q", m.vpnAddName))
@@ -460,8 +489,14 @@ func (m Model) View() string {
 	// Input area
 	if m.inputMode != inputNone {
 		b.WriteString("\n")
-		b.WriteString(inputStyle.Render(m.textInput.View()))
-		b.WriteString("\n")
+		if m.inputMode == inputAddVPN && m.vpnAddPhase == 1 {
+			b.WriteString(fmt.Sprintf("  Config name: %s\n", m.vpnAddName))
+			b.WriteString(inputStyle.Render(m.textArea.View()))
+			b.WriteString("\n")
+		} else {
+			b.WriteString(inputStyle.Render(m.textInput.View()))
+			b.WriteString("\n")
+		}
 	}
 
 	// Messages
@@ -754,7 +789,11 @@ func (m Model) renderHelp() string {
 	}
 
 	if m.inputMode != inputNone {
-		help = "enter:submit  esc:cancel"
+		if m.inputMode == inputAddVPN && m.vpnAddPhase == 1 {
+			help = "ctrl+s:submit  esc:cancel  (paste multi-line config)"
+		} else {
+			help = "enter:submit  esc:cancel"
+		}
 	}
 
 	return helpStyle.Render(help)
