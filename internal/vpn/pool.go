@@ -1,6 +1,7 @@
 package vpn
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -29,15 +30,19 @@ type Pool struct {
 	inUse    map[string]bool      // config name -> in use
 	disabled map[string]bool      // config name -> manually disabled
 	cooldown map[string]time.Time // config name -> cooldown expiry
+	lastUsed map[string]time.Time // config name -> last time Acquire returned it
 }
 
 func NewPool() *Pool {
-	return &Pool{
+	p := &Pool{
 		configs:  make(map[string]*WireGuardConfig),
 		inUse:    make(map[string]bool),
 		disabled: make(map[string]bool),
 		cooldown: make(map[string]time.Time),
+		lastUsed: make(map[string]time.Time),
 	}
+	p.loadUsage()
+	return p
 }
 
 // LoadConfigs reads all .conf files from the wireguard config directory.
@@ -147,15 +152,21 @@ func (p *Pool) RemoveConfig(name string) error {
 	delete(p.configs, name)
 	delete(p.disabled, name)
 	delete(p.cooldown, name)
+	delete(p.lastUsed, name)
+	p.saveUsage()
 	return nil
 }
 
-// Acquire claims an available config for use. Returns nil if none available.
+// Acquire claims an available config for use, preferring the least-recently-used.
+// Returns nil if none available.
 func (p *Pool) Acquire() *WireGuardConfig {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	now := time.Now()
+
+	// Collect candidates.
+	var candidates []*WireGuardConfig
 	for name, cfg := range p.configs {
 		if p.inUse[name] {
 			continue
@@ -166,13 +177,31 @@ func (p *Pool) Acquire() *WireGuardConfig {
 		if expiry, ok := p.cooldown[name]; ok && now.Before(expiry) {
 			continue
 		}
-		// Clear expired cooldown
 		delete(p.cooldown, name)
-		p.inUse[name] = true
-		cfg.InUse = true
-		return cfg
+		candidates = append(candidates, cfg)
 	}
-	return nil
+
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	// Sort by last-used time ascending (oldest first). Configs never used sort
+	// before everything else (zero time).
+	sort.Slice(candidates, func(i, j int) bool {
+		ti := p.lastUsed[candidates[i].Name]
+		tj := p.lastUsed[candidates[j].Name]
+		if ti.Equal(tj) {
+			return candidates[i].Name < candidates[j].Name // stable tiebreak
+		}
+		return ti.Before(tj)
+	})
+
+	cfg := candidates[0]
+	p.inUse[cfg.Name] = true
+	cfg.InUse = true
+	p.lastUsed[cfg.Name] = now
+	p.saveUsage()
+	return cfg
 }
 
 // Release returns a config to the pool.
@@ -282,4 +311,26 @@ func (p *Pool) List() []*WireGuardConfig {
 	})
 
 	return result
+}
+
+// loadUsage reads persisted last-used timestamps from disk.
+func (p *Pool) loadUsage() {
+	data, err := os.ReadFile(config.VPNUsagePath())
+	if err != nil {
+		return
+	}
+	var usage map[string]time.Time
+	if err := json.Unmarshal(data, &usage); err != nil {
+		return
+	}
+	p.lastUsed = usage
+}
+
+// saveUsage writes last-used timestamps to disk. Must be called with mu held.
+func (p *Pool) saveUsage() {
+	data, err := json.Marshal(p.lastUsed)
+	if err != nil {
+		return
+	}
+	os.WriteFile(config.VPNUsagePath(), data, 0600)
 }

@@ -49,6 +49,10 @@ func ConfigPath() string {
 	return filepath.Join(ConfigDir(), "config.json")
 }
 
+func VPNUsagePath() string {
+	return filepath.Join(ConfigDir(), "vpn-usage.json")
+}
+
 func Load() (*Config, error) {
 	path := ConfigPath()
 	cfg := DefaultConfig()
