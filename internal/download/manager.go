@@ -27,9 +27,11 @@ const (
 	StatusError
 	StatusStale
 	StatusCancelled
+	StatusReconnecting // tearing down stale tunnel, will re-queue to resume on a new VPN
 )
 
 const cooldownDuration = 5 * time.Minute
+const maxReconnects = 3 // auto-reconnect attempts before marking stale
 
 func (s Status) String() string {
 	switch s {
@@ -47,6 +49,8 @@ func (s Status) String() string {
 		return "Stale"
 	case StatusCancelled:
 		return "Cancelled"
+	case StatusReconnecting:
+		return "Reconnecting"
 	default:
 		return "Unknown"
 	}
@@ -73,6 +77,7 @@ type Download struct {
 	StaleNotified bool
 	RateLimited   bool // true if this download hit a 429
 	Retries       int  // number of times this download was re-queued due to tunnel failures
+	Reconnects    int  // number of times auto-reconnected due to stale/idle
 }
 
 func (d *Download) Progress() float64 {
@@ -196,7 +201,7 @@ func (m *Manager) Stop() {
 	var interrupted []interruptedDL
 	for _, dl := range m.downloads {
 		switch dl.Status {
-		case StatusDownloading, StatusStarting, StatusQueued, StatusStale:
+		case StatusDownloading, StatusStarting, StatusQueued, StatusStale, StatusReconnecting:
 			vpnName := dl.VPNConfig
 			dl.Status = StatusCancelled
 			dl.Error = "interrupted by shutdown"
@@ -276,6 +281,7 @@ func (m *Manager) Restart(id string) {
 			d.VPNConfig = ""
 			d.Interface = ""
 			d.Retries = 0
+			d.Reconnects = 0
 			d.StaleNotified = false
 			d.RateLimited = false
 			d.LastProgress = time.Time{}
@@ -412,7 +418,7 @@ func (m *Manager) processQueue() {
 
 	var dl *Download
 	for _, d := range m.downloads {
-		if d.ID == dlID && d.Status == StatusQueued {
+		if d.ID == dlID && (d.Status == StatusQueued || d.Status == StatusReconnecting) {
 			dl = d
 			break
 		}
@@ -656,6 +662,27 @@ func (m *Manager) updateStatuses() {
 
 			staleDuration := time.Duration(m.cfg.StaleTimeoutMins) * time.Minute
 			if time.Since(dl.LastProgress) > staleDuration && !dl.StaleNotified {
+				if dl.Reconnects < maxReconnects {
+					// Auto-reconnect: tear down stale tunnel, re-queue to resume
+					// on a different VPN. The partial file stays on disk and aria2c's
+					// --continue=true will resume from where it left off.
+					dl.Status = StatusReconnecting
+					dl.Reconnects++
+					vpnName := dl.VPNConfig
+					dl.GID = ""
+					dl.RPCPort = 0
+					dl.VPNConfig = ""
+					dl.Interface = ""
+					dl.StaleNotified = false
+					dl.LastProgress = time.Time{}
+					dl.LastBytes = 0
+					dl.Speed = 0
+					m.queue = append(m.queue, dl.ID)
+					m.mu.Unlock()
+					go m.cleanupTunnel(vpnName)
+					continue
+				}
+				// Exhausted reconnect attempts — mark stale for manual intervention
 				dl.Status = StatusStale
 				dl.StaleNotified = true
 			}
@@ -710,7 +737,7 @@ func (m *Manager) saveQueue() {
 	urls := make([]string, 0)
 	for _, d := range m.downloads {
 		switch d.Status {
-		case StatusQueued, StatusStarting, StatusDownloading, StatusStale:
+		case StatusQueued, StatusStarting, StatusDownloading, StatusStale, StatusReconnecting:
 			urls = append(urls, d.URL)
 		}
 	}

@@ -723,6 +723,8 @@ func (m Model) renderDownloads() string {
 			statusStr = statusStaleStyle.Render("[STALE]")
 		case download.StatusCancelled:
 			statusStr = statusCancelledStyle.Render("[CANCELLED]")
+		case download.StatusReconnecting:
+			statusStr = statusStartingStyle.Render("[RECONNECTING]")
 		}
 
 		// URL (truncated)
@@ -746,8 +748,8 @@ func (m Model) renderDownloads() string {
 		}
 		b.WriteString(line + "\n")
 
-		// Progress line for active downloads
-		if dl.Status == download.StatusDownloading || dl.Status == download.StatusStale {
+		// Progress line for active/reconnecting downloads
+		if dl.Status == download.StatusDownloading || dl.Status == download.StatusStale || dl.Status == download.StatusReconnecting {
 			bar := renderProgressBar(dl.Progress(), 30)
 			eta := ""
 			if dl.Speed > 0 && dl.TotalSize > 0 {
@@ -755,20 +757,28 @@ func (m Model) renderDownloads() string {
 				secs := remaining / dl.Speed
 				eta = fmt.Sprintf("  ETA %s", formatDuration(time.Duration(secs)*time.Second))
 			}
-			info := fmt.Sprintf("   %s  %s / %s  %s%s  VPN: %s",
-				bar,
-				dl.CompletedStr(), dl.TotalStr(),
-				dl.SpeedStr(),
-				eta,
-				dl.VPNConfig)
+			var info string
+			if dl.Status == download.StatusReconnecting {
+				info = fmt.Sprintf("   %s  %s / %s  switching VPN (attempt %d/%d)",
+					bar,
+					dl.CompletedStr(), dl.TotalStr(),
+					dl.Reconnects, 3)
+			} else {
+				info = fmt.Sprintf("   %s  %s / %s  %s%s  VPN: %s",
+					bar,
+					dl.CompletedStr(), dl.TotalStr(),
+					dl.SpeedStr(),
+					eta,
+					dl.VPNConfig)
 
-			// Show time without progress for active downloads approaching stale
-			staleDur := dl.StaleDuration()
-			staleTimeout := m.dlMgr.StaleTimeout()
-			if dl.Status == download.StatusDownloading && staleDur > 30*time.Second {
-				remaining := staleTimeout - staleDur
-				if remaining > 0 {
-					info += fmt.Sprintf("  idle %s/%s", staleDur.Truncate(time.Second), staleTimeout.Truncate(time.Second))
+				// Show time without progress for active downloads approaching stale
+				staleDur := dl.StaleDuration()
+				staleTimeout := m.dlMgr.StaleTimeout()
+				if dl.Status == download.StatusDownloading && staleDur > 30*time.Second {
+					remaining := staleTimeout - staleDur
+					if remaining > 0 {
+						info += fmt.Sprintf("  idle %s/%s", staleDur.Truncate(time.Second), staleTimeout.Truncate(time.Second))
+					}
 				}
 			}
 
