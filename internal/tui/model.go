@@ -672,6 +672,9 @@ func (m Model) renderHeader() string {
 	stats := fmt.Sprintf(" VPN: %d/%d  Active: %d/%d",
 		m.vpnPool.InUseCount(), m.vpnPool.Total(),
 		m.dlMgr.ActiveCount(), m.cfg.MaxConcurrent)
+	if grace := m.dlMgr.PeerGraceRemaining(); grace > 0 {
+		stats += fmt.Sprintf("  Peer cooldown: %ds", int(grace.Seconds()))
+	}
 	return headerStyle.Width(m.width).Render(title + stats)
 }
 

@@ -122,17 +122,19 @@ func formatBytes(b int64) string {
 
 // Manager coordinates downloads across WireGuard tunnels.
 type Manager struct {
-	mu          sync.RWMutex
-	downloads   []*Download
-	queue       []string // IDs of queued downloads
-	rpcClients  map[int]*Aria2Client // rpcPort -> cached client (reuses http.Client connection pool)
-	cfg         *config.Config
-	vpnPool     *vpn.Pool
-	tunnelMgr   *tunnel.Manager
-	hist        *history.Store
-	nextID      int
-	ctx         context.Context
-	cancel      context.CancelFunc
+	mu              sync.RWMutex
+	downloads       []*Download
+	queue           []string // IDs of queued downloads
+	rpcClients      map[int]*Aria2Client // rpcPort -> cached client (reuses http.Client connection pool)
+	lastTeardown    time.Time // when the most recent tunnel was torn down
+	peakBeforeFree  bool      // true if we were at MaxConcurrent when the last slot freed
+	cfg             *config.Config
+	vpnPool         *vpn.Pool
+	tunnelMgr       *tunnel.Manager
+	hist            *history.Store
+	nextID          int
+	ctx             context.Context
+	cancel          context.CancelFunc
 }
 
 func NewManager(cfg *config.Config, vpnPool *vpn.Pool, tunnelMgr *tunnel.Manager, hist *history.Store) *Manager {
@@ -321,6 +323,21 @@ func (m *Manager) StaleTimeout() time.Duration {
 	return time.Duration(m.cfg.StaleTimeoutMins) * time.Minute
 }
 
+// PeerGraceRemaining returns how long until the peer teardown grace period expires.
+// Returns 0 if no grace period is active (i.e., safe to start new tunnels immediately).
+func (m *Manager) PeerGraceRemaining() time.Duration {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.peakBeforeFree {
+		return 0
+	}
+	remaining := peerTeardownGrace - time.Since(m.lastTeardown)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
 func (m *Manager) processLoop() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -345,6 +362,13 @@ func (m *Manager) processQueue() {
 	}
 
 	if active >= m.cfg.MaxConcurrent || len(m.queue) == 0 {
+		m.mu.Unlock()
+		return
+	}
+
+	// If we just freed a slot from a full pool, wait for the VPN server to drop
+	// the old peer before opening a new tunnel on the same provider account.
+	if m.peakBeforeFree && time.Since(m.lastTeardown) < peerTeardownGrace {
 		m.mu.Unlock()
 		return
 	}
@@ -601,6 +625,13 @@ func (m *Manager) updateStatuses() {
 	}
 }
 
+// peerTeardownGrace is how long we wait after tearing down a tunnel that was at the
+// max-concurrent limit before starting a new one. This gives the VPN server time to
+// expire the old WireGuard peer session (handshake timeout is typically 2-5 min, but
+// most providers notice within ~90s). We only apply this delay when we were actually
+// at the concurrency ceiling — otherwise there's no risk of exceeding it.
+const peerTeardownGrace = 90 * time.Second
+
 // cleanupTunnel tears down the tunnel and releases the VPN config back to the pool.
 // The vpnName must be captured by the caller before clearing dl.VPNConfig to avoid races.
 func (m *Manager) cleanupTunnel(vpnName string) {
@@ -616,6 +647,21 @@ func (m *Manager) cleanupTunnel(vpnName string) {
 	}
 	m.tunnelMgr.StopTunnel(context.Background(), vpnName)
 	m.vpnPool.Release(vpnName)
+
+	// Record teardown time so processQueue can enforce the grace period.
+	m.mu.Lock()
+	active := 0
+	for _, d := range m.downloads {
+		if d.Status == StatusStarting || d.Status == StatusDownloading {
+			active++
+		}
+	}
+	// We were "at peak" if, before this teardown freed a slot, we were at max.
+	// active is already decremented (status was changed before cleanupTunnel is called),
+	// so active+1 was the count before the slot freed.
+	m.peakBeforeFree = (active + 1) >= m.cfg.MaxConcurrent
+	m.lastTeardown = time.Now()
+	m.mu.Unlock()
 }
 
 // saveQueue persists all queued/active URLs to disk so they survive restarts.
