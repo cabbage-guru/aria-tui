@@ -127,7 +127,6 @@ type Manager struct {
 	queue           []string // IDs of queued downloads
 	rpcClients      map[int]*Aria2Client // rpcPort -> cached client (reuses http.Client connection pool)
 	lastTeardown    time.Time // when the most recent tunnel was torn down
-	peakBeforeFree  bool      // true if we were at MaxConcurrent when the last slot freed
 	cfg             *config.Config
 	vpnPool         *vpn.Pool
 	tunnelMgr       *tunnel.Manager
@@ -328,7 +327,7 @@ func (m *Manager) StaleTimeout() time.Duration {
 func (m *Manager) PeerGraceRemaining() time.Duration {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if !m.peakBeforeFree {
+	if m.lastTeardown.IsZero() {
 		return 0
 	}
 	remaining := peerTeardownGrace - time.Since(m.lastTeardown)
@@ -366,9 +365,10 @@ func (m *Manager) processQueue() {
 		return
 	}
 
-	// If we just freed a slot from a full pool, wait for the VPN server to drop
-	// the old peer before opening a new tunnel on the same provider account.
-	if m.peakBeforeFree && time.Since(m.lastTeardown) < peerTeardownGrace {
+	// After any tunnel teardown, wait before starting a new one. Even at low
+	// concurrency, rapid churn (short downloads, retries) causes a flood of
+	// WireGuard handshakes that can trip provider rate limits.
+	if !m.lastTeardown.IsZero() && time.Since(m.lastTeardown) < peerTeardownGrace {
 		m.mu.Unlock()
 		return
 	}
@@ -625,11 +625,11 @@ func (m *Manager) updateStatuses() {
 	}
 }
 
-// peerTeardownGrace is how long we wait after tearing down a tunnel that was at the
-// max-concurrent limit before starting a new one. This gives the VPN server time to
-// expire the old WireGuard peer session (handshake timeout is typically 2-5 min, but
-// most providers notice within ~90s). We only apply this delay when we were actually
-// at the concurrency ceiling — otherwise there's no risk of exceeding it.
+// peerTeardownGrace is how long we wait after any tunnel teardown before starting
+// a new one. VPN providers track peers by public key and last handshake — the
+// server-side session lingers after the client closes. Rapid tunnel churn (even
+// at low concurrency) creates a burst of new handshakes that can trip provider
+// rate/connection limits.
 const peerTeardownGrace = 90 * time.Second
 
 // cleanupTunnel tears down the tunnel and releases the VPN config back to the pool.
@@ -648,18 +648,8 @@ func (m *Manager) cleanupTunnel(vpnName string) {
 	m.tunnelMgr.StopTunnel(context.Background(), vpnName)
 	m.vpnPool.Release(vpnName)
 
-	// Record teardown time so processQueue can enforce the grace period.
+	// Record teardown time so processQueue enforces the grace period.
 	m.mu.Lock()
-	active := 0
-	for _, d := range m.downloads {
-		if d.Status == StatusStarting || d.Status == StatusDownloading {
-			active++
-		}
-	}
-	// We were "at peak" if, before this teardown freed a slot, we were at max.
-	// active is already decremented (status was changed before cleanupTunnel is called),
-	// so active+1 was the count before the slot freed.
-	m.peakBeforeFree = (active + 1) >= m.cfg.MaxConcurrent
 	m.lastTeardown = time.Now()
 	m.mu.Unlock()
 }
