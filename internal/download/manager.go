@@ -126,7 +126,7 @@ type Manager struct {
 	downloads       []*Download
 	queue           []string // IDs of queued downloads
 	rpcClients      map[int]*Aria2Client // rpcPort -> cached client (reuses http.Client connection pool)
-	lastTeardown    time.Time // when the most recent tunnel was torn down
+	tunnelStarts    []time.Time // sliding window of recent tunnel start times for rate limiting
 	cfg             *config.Config
 	vpnPool         *vpn.Pool
 	tunnelMgr       *tunnel.Manager
@@ -322,19 +322,51 @@ func (m *Manager) StaleTimeout() time.Duration {
 	return time.Duration(m.cfg.StaleTimeoutMins) * time.Minute
 }
 
-// PeerGraceRemaining returns how long until the peer teardown grace period expires.
-// Returns 0 if no grace period is active (i.e., safe to start new tunnels immediately).
+// PeerGraceRemaining returns how long until the next tunnel start is allowed
+// under the rate limit (max MaxConcurrent starts per peerRateWindow). Returns 0
+// if a new tunnel can start immediately.
 func (m *Manager) PeerGraceRemaining() time.Duration {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.lastTeardown.IsZero() {
+	return m.rateLimitWait()
+}
+
+// rateLimitWait returns how long to wait before starting a new tunnel.
+// Must be called with mu held (read or write).
+func (m *Manager) rateLimitWait() time.Duration {
+	limit := m.cfg.MaxConcurrent
+	if limit <= 0 {
+		limit = 1
+	}
+	now := time.Now()
+	cutoff := now.Add(-peerRateWindow)
+
+	// Count starts within the window.
+	recent := 0
+	for _, t := range m.tunnelStarts {
+		if t.After(cutoff) {
+			recent++
+		}
+	}
+
+	if recent < limit {
 		return 0
 	}
-	remaining := peerTeardownGrace - time.Since(m.lastTeardown)
-	if remaining < 0 {
+
+	// We're at the limit. The oldest relevant start determines when a slot opens.
+	// Find the (recent - limit + 1)th oldest start in the window — that's the one
+	// whose expiry frees a slot. Since tunnelStarts is append-only chronological,
+	// walk from the end backwards to find the Nth most recent.
+	idx := len(m.tunnelStarts) - limit
+	if idx < 0 {
+		idx = 0
+	}
+	oldest := m.tunnelStarts[idx]
+	wait := peerRateWindow - now.Sub(oldest)
+	if wait < 0 {
 		return 0
 	}
-	return remaining
+	return wait
 }
 
 func (m *Manager) processLoop() {
@@ -365,10 +397,11 @@ func (m *Manager) processQueue() {
 		return
 	}
 
-	// After any tunnel teardown, wait before starting a new one. Even at low
-	// concurrency, rapid churn (short downloads, retries) causes a flood of
-	// WireGuard handshakes that can trip provider rate limits.
-	if !m.lastTeardown.IsZero() && time.Since(m.lastTeardown) < peerTeardownGrace {
+	// Rate-limit new tunnel starts: at most MaxConcurrent new tunnels per
+	// peerRateWindow. This prevents rapid churn from exceeding the number of
+	// concurrent WireGuard sessions the provider sees (server-side sessions
+	// linger after client teardown).
+	if m.rateLimitWait() > 0 {
 		m.mu.Unlock()
 		return
 	}
@@ -407,6 +440,11 @@ func (m *Manager) processQueue() {
 	// Start WireGuard tunnel + aria2c
 	tun, err := m.tunnelMgr.StartTunnel(m.ctx, wgCfg.Name, wgCfg.Contents)
 	if err != nil {
+		// Record even failed starts — the provider still saw the handshake attempt.
+		m.mu.Lock()
+		m.recordTunnelStart()
+		m.mu.Unlock()
+
 		m.vpnPool.Release(wgCfg.Name)
 		m.mu.Lock()
 		dl.Retries++
@@ -425,6 +463,7 @@ func (m *Manager) processQueue() {
 	}
 
 	m.mu.Lock()
+	m.recordTunnelStart()
 	dl.VPNConfig = wgCfg.Name
 	dl.Interface = tun.Interface
 	dl.RPCPort = tun.RPCPort
@@ -625,12 +664,29 @@ func (m *Manager) updateStatuses() {
 	}
 }
 
-// peerTeardownGrace is how long we wait after any tunnel teardown before starting
-// a new one. VPN providers track peers by public key and last handshake — the
-// server-side session lingers after the client closes. Rapid tunnel churn (even
-// at low concurrency) creates a burst of new handshakes that can trip provider
-// rate/connection limits.
-const peerTeardownGrace = 90 * time.Second
+// peerRateWindow is the sliding window for tunnel start rate limiting.
+// VPN providers see each WireGuard handshake as a new peer session. Server-side
+// sessions linger ~90-180s after the client closes, so within any 2-minute window
+// we must not start more tunnels than MaxConcurrent to avoid exceeding the
+// provider's simultaneous connection limit.
+const peerRateWindow = 2 * time.Minute
+
+// recordTunnelStart appends a timestamp to the sliding window and prunes expired
+// entries. Must be called with mu held for writing.
+func (m *Manager) recordTunnelStart() {
+	now := time.Now()
+	cutoff := now.Add(-peerRateWindow)
+
+	// Prune expired entries.
+	n := 0
+	for _, t := range m.tunnelStarts {
+		if t.After(cutoff) {
+			m.tunnelStarts[n] = t
+			n++
+		}
+	}
+	m.tunnelStarts = append(m.tunnelStarts[:n], now)
+}
 
 // cleanupTunnel tears down the tunnel and releases the VPN config back to the pool.
 // The vpnName must be captured by the caller before clearing dl.VPNConfig to avoid races.
@@ -647,11 +703,6 @@ func (m *Manager) cleanupTunnel(vpnName string) {
 	}
 	m.tunnelMgr.StopTunnel(context.Background(), vpnName)
 	m.vpnPool.Release(vpnName)
-
-	// Record teardown time so processQueue enforces the grace period.
-	m.mu.Lock()
-	m.lastTeardown = time.Now()
-	m.mu.Unlock()
 }
 
 // saveQueue persists all queued/active URLs to disk so they survive restarts.
