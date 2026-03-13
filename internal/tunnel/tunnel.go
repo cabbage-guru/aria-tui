@@ -34,12 +34,16 @@ type Manager struct {
 	mu          sync.Mutex
 	tunnels     map[string]*Tunnel
 	downloadDir string
+	netmon      *networkMonitor
 }
 
 func NewManager(downloadDir string) *Manager {
+	nm := newNetworkMonitor()
+	go nm.run()
 	return &Manager{
 		tunnels:     make(map[string]*Tunnel),
 		downloadDir: downloadDir,
+		netmon:      nm,
 	}
 }
 
@@ -120,11 +124,16 @@ func (m *Manager) StartTunnel(ctx context.Context, name string, wgConfigContents
 	m.tunnels[name] = t
 	m.mu.Unlock()
 
+	// Register with network monitor so BindUpdate is called on network changes.
+	m.netmon.add(name, wg.device)
+
 	return t, nil
 }
 
 // StopTunnel tears down a tunnel.
 func (m *Manager) StopTunnel(ctx context.Context, name string) error {
+	m.netmon.remove(name)
+
 	m.mu.Lock()
 	t, ok := m.tunnels[name]
 	if !ok {
@@ -166,11 +175,14 @@ func stopTunnel(t *Tunnel) error {
 	return nil
 }
 
-// StopAll tears down all active tunnels.
+// StopAll tears down all active tunnels and shuts down the network monitor.
 func (m *Manager) StopAll(ctx context.Context) {
+	m.netmon.close()
+
 	m.mu.Lock()
 	tunnels := make([]*Tunnel, 0, len(m.tunnels))
-	for _, t := range m.tunnels {
+	for name, t := range m.tunnels {
+		m.netmon.remove(name)
 		tunnels = append(tunnels, t)
 	}
 	m.tunnels = make(map[string]*Tunnel)
