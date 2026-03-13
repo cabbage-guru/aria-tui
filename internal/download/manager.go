@@ -666,10 +666,9 @@ func (m *Manager) updateStatuses() {
 
 // peerRateWindow is the sliding window for tunnel start rate limiting.
 // VPN providers see each WireGuard handshake as a new peer session. Server-side
-// sessions linger ~90-180s after the client closes, so within any 2-minute window
-// we must not start more tunnels than MaxConcurrent to avoid exceeding the
-// provider's simultaneous connection limit.
-const peerRateWindow = 2 * time.Minute
+// sessions linger after the client closes — most providers take 2-5 minutes to
+// expire a stale peer. A 3-minute window gives comfortable margin.
+const peerRateWindow = 3 * time.Minute
 
 // recordTunnelStart appends a timestamp to the sliding window and prunes expired
 // entries. Must be called with mu held for writing.
